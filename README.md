@@ -69,6 +69,43 @@ Nothing gets deleted until step 5 has proved the replacement is complete and its
 file content is byte for byte identical to the original. The tool is paranoid on
 your behalf, because the alternative is a very bad afternoon.
 
+## Two modes, and how to pick
+
+**Most people want `--in-place`.** It rewrites history and force-pushes the same
+repo. Nothing is renamed, nothing is deleted, you keep every star.
+
+```sh
+declaudify --in-place owner/repo
+```
+
+The reason this is enough: GitHub's **contributors graph is computed from the
+default branch only**. Pull-request refs never feed it. So if your complaint is
+the orange avatar sitting in your contributors list, a force-push removes it and
+you do not need to replace anything.
+
+Measured on a throwaway repo: `claude` dropped off the contributors graph
+**371 seconds** after the force-push. Not the 24 to 48 hours the internet will
+tell you.
+
+> **Do not poke it while it recomputes.** In a side-by-side test, the repo left
+> alone cleared in 371s. An identical repo that got an extra commit, a rename and
+> a visibility toggle never finished recomputing at all. Every push, rename or
+> visibility change re-invalidates the cache and restarts the clock. That is
+> almost certainly why people report multi-day waits.
+
+**Use the default mode** when you need the old commits genuinely gone, not just
+absent from the graph. A force-push cannot reach `refs/pull/N/head`, so old
+commits stay fetchable by SHA forever. Only replacing the repository removes
+them, and that is what costs you the stars.
+
+| | `--in-place` | default (replace) |
+|---|---|---|
+| Stars, forks, issues, PRs | kept | **lost** |
+| Off the contributors graph | yes, minutes | yes, immediately |
+| Old commits gone from PR refs | no | yes |
+| Needs `delete_repo` scope | no | yes |
+| Needs admin | no | yes |
+
 ## Install
 
 ```sh

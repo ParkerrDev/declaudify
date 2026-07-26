@@ -356,6 +356,23 @@ is "…and reports zero stars" "$GH_LOSS_STARS" "0"
 
 unset -f gh
 
+suite "in-place mode"
+
+out=$("$ROOT/declaudify" --help)
+has "--in-place is documented" "$out" "--in-place"
+has "…and says it keeps stars" "$out" "Keeps stars"
+has "…and is honest about what it leaves behind" "$out" "PR refs"
+
+# The mode must never reach the rename/create/delete path.
+src=$(cat "$ROOT/declaudify")
+has "in-place forces keep-old so nothing is deleted" "$src" "KEEP_OLD=1"
+has "in-place exits before the replacement plan" "$src" 'say "    Re-clone local copies: git clone $PUSH_URL"'
+hasnt "in-place block never calls gh_delete" \
+   "$(printf '%s' "$src" | sed -n '/^if (( IN_PLACE )); then/,/^fi$/p')" "gh_delete"
+hasnt "in-place block never calls gh_rename" \
+   "$(printf '%s' "$src" | sed -n '/^if (( IN_PLACE )); then/,/^fi$/p')" "gh_rename"
+has "in-place warns against nudging the graph" "$src" "restarts GitHub's recomputation"
+
 suite "installer"
 
 sh -n "$ROOT/install.sh" && r=ok || r=failed

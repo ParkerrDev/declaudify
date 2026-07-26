@@ -44,6 +44,7 @@ source "$SELF_DIR/lib/github.sh"
 # --- defaults ----------------------------------------------------------------
 
 SUFFIX='.'
+IN_PLACE=0
 KEEP_OLD=0
 KEEP_OLD_SET=0
 PREVIEW_LIMIT=10
@@ -70,6 +71,11 @@ OPTIONS
                            and touch nothing on GitHub. Always run this first.
     -y, --yes              Skip confirmation prompts. Dangerous by design.
     -v, --verbose          Show every step instead of just the important ones.
+        --in-place         Rewrite and force-push the SAME repo instead of
+                           replacing it. Keeps stars, issues, PRs and forks,
+                           and clears the contributors graph in a few minutes.
+                           Old commits stay reachable by SHA and in PR refs,
+                           but neither feeds the contributors graph.
         --keep-old         Keep the renamed old repo instead of deleting it.
         --delete-old       Delete the old repo without being asked which to do.
                            Without either flag you are asked interactively.
@@ -110,6 +116,7 @@ while [[ $# -gt 0 ]]; do
         -n|--dry-run)      DECLAUDIFY_DRY_RUN=1 ;;
         -y|--yes)          DECLAUDIFY_ASSUME_YES=1 ;;
         -v|--verbose)      DECLAUDIFY_VERBOSE=1 ;;
+        --in-place)        IN_PLACE=1 ;;
         --keep-old)        KEEP_OLD=1; KEEP_OLD_SET=1 ;;
         --delete-old)      KEEP_OLD=0; KEEP_OLD_SET=1 ;;
         --suffix)          SUFFIX=${2:?--suffix needs a value}; shift ;;
@@ -190,12 +197,18 @@ CLONE_URL=$(gh_repo_field "$REPO" '.clone_url')
 
 detail "$REPO (id $REPO_ID, $VISIBILITY, default branch: $DEFAULT_BRANCH)"
 
-[[ $IS_ADMIN == true ]] || die "you need admin rights on $REPO to rename and delete it"
 [[ $IS_ARCHIVED == true ]] && die "$REPO is archived - unarchive it first"
-[[ $IS_FORK == true ]] && warn "$REPO is a fork; the replacement will be a standalone repo, not a fork"
 
-if gh_repo_exists "$OWNER/$OLD_NAME"; then
-    die "$OWNER/$OLD_NAME already exists - pick another --suffix"
+# In-place only force-pushes, so push access is enough. Replacing the repo needs
+# admin, and needs the renamed-aside name to be free.
+if (( ! IN_PLACE )); then
+    [[ $IS_ADMIN == true ]] || die "you need admin rights on $REPO to rename and delete it.
+       Use --in-place to rewrite it without replacing it."
+    [[ $IS_FORK == true ]] && warn "$REPO is a fork; the replacement will be a standalone repo, not a fork"
+
+    if gh_repo_exists "$OWNER/$OLD_NAME"; then
+        die "$OWNER/$OLD_NAME already exists - pick another --suffix"
+    fi
 fi
 
 # Check token scopes NOW, never after the repo has been renamed. A missing scope
@@ -204,7 +217,12 @@ fi
 CAN_DELETE=1
 SCOPES=$(gh_token_scopes)
 
-if [[ $DECLAUDIFY_DRY_RUN == 0 ]]; then
+# In-place mode never deletes or renames anything, so it only needs push access.
+if (( IN_PLACE )); then
+    CAN_DELETE=0
+    KEEP_OLD=1
+    KEEP_OLD_SET=1
+elif [[ $DECLAUDIFY_DRY_RUN == 0 ]]; then
     if [[ -z $SCOPES ]]; then
         warn "cannot read your token's scopes (fine-grained PAT or GitHub App token)."
         warn "declaudify will continue, but a missing permission will only show up"
@@ -382,6 +400,103 @@ detail "no attribution lines and no Claude identities remain"
 residual=$(dc_residual_count "$MIRROR")
 if (( residual > 0 )); then
     detail "$residual line(s) mention claude/anthropic in prose or a human name, left alone"
+fi
+
+# =============================================================================
+# In-place mode: rewrite and force-push, keeping the repository
+# =============================================================================
+#
+# GitHub's contributors graph is computed from the DEFAULT BRANCH only, so a
+# force-push is enough to drop Claude from it. Pull-request refs keep the old
+# commits fetchable by SHA, but they never feed the graph, which is why this
+# mode does not need to replace the repository and costs no stars.
+#
+# Measured on a throwaway repo: the graph cleared 371 seconds after the push.
+# Nudging it (another push, a rename, a visibility toggle) re-invalidates the
+# cache and restarts the computation, so this mode deliberately does nothing
+# after the push except watch.
+
+if (( IN_PLACE )); then
+    step "This rewrites $REPO in place"
+    say "    force-push $REPO_SIZE to $OWNER/$NAME"
+    say "    the repository, its stars, issues, PRs and forks all stay put"
+    say ''
+    say "    ${C_YELLOW}Commit SHAs change,${C_RESET} so existing clones need re-cloning."
+    say "    ${C_DIM}Old commits stay reachable by SHA and in pull-request refs, but${C_RESET}"
+    say "    ${C_DIM}neither feeds the contributors graph. Use the default mode if you${C_RESET}"
+    say "    ${C_DIM}need them gone entirely.${C_RESET}"
+
+    if [[ $DECLAUDIFY_DRY_RUN == 1 ]]; then
+        step "Dry run: nothing on GitHub was touched"
+        say "    Rewritten mirror: $MIRROR"
+        say "    Backup bundle:    $WORKDIR/backup.bundle"
+        exit 0
+    fi
+
+    confirm "Force-push the rewritten history to $REPO?" "$NAME"
+
+    step "Rewriting in place"
+    PUSH_URL="https://github.com/$REPO.git"
+    git -C "$MIRROR" push --force --quiet "$PUSH_URL" 'refs/heads/*:refs/heads/*' ||
+        die "push failed; $REPO is unchanged"
+    git -C "$MIRROR" push --force --quiet "$PUSH_URL" 'refs/tags/*:refs/tags/*' 2>/dev/null || true
+    ok "force-pushed $REPO_SIZE"
+
+    VERIFY="$WORKDIR/verify.git"
+    rm -rf "$VERIFY"
+    git clone --quiet --mirror "$PUSH_URL" "$VERIFY"
+    dc_prune_foreign_refs "$VERIFY" >/dev/null
+
+    if [[ $(dc_snapshot "$VERIFY") != "$SNAP_AFTER" ]]; then
+        diff <(printf '%s\n' "$SNAP_AFTER") <(dc_snapshot "$VERIFY") >&2 || true
+        die "the pushed history does not match the local rewrite"
+    fi
+    if [[ $(printf '%s\n' "$SNAP_BEFORE" | awk '{print $1, $2, $3}') != \
+          $(dc_snapshot "$VERIFY" | awk '{print $1, $2, $3}') ]]; then
+        die "file content changed during the rewrite"
+    fi
+    (( $(dc_residual_attribution_count "$VERIFY") == 0 )) || die "attribution still present on GitHub"
+    (( $(dc_residual_identity_count "$VERIFY") == 0 ))    || die "Claude identities still present on GitHub"
+    ok "verified on GitHub: content identical, no Claude attribution on any branch"
+
+    step "Waiting for the contributors graph"
+    say "    ${C_BOLD}Do not push, rename, or change visibility until this finishes.${C_RESET}"
+    say "    ${C_DIM}Each of those restarts GitHub's recomputation from scratch.${C_RESET}"
+
+    graph_t0=$(date +%s)
+    graph_done=0
+    for _ in $(seq 1 "${DECLAUDIFY_GRAPH_TRIES:-90}"); do
+        graph=$(gh api "repos/$REPO/stats/contributors" \
+                --jq '[.[] | "\(.author.login)"] | join(" ")' 2>/dev/null || true)
+        elapsed=$(( $(date +%s) - graph_t0 ))
+        if [[ -n $graph ]]; then
+            if printf '%s\n' "$graph" | grep -qiE "$(dc_ident_re)"; then
+                detail "${elapsed}s: still listed ($graph)"
+            else
+                ok "Claude left the contributors graph after ${elapsed}s"
+                say "    now: $graph"
+                graph_done=1
+                break
+            fi
+        else
+            detail "${elapsed}s: GitHub is recomputing (HTTP 202)"
+        fi
+        sleep 10
+    done
+
+    if (( ! graph_done )); then
+        say ''
+        warn "the graph had not finished recomputing when this gave up watching."
+        warn "That is normal; it usually settles within about ten minutes. Check with:"
+        say "        gh api repos/$REPO/stats/contributors --jq '[.[].author.login]'"
+        warn "Do not push anything in the meantime or the clock restarts."
+    fi
+
+    step "Done"
+    say "    $REPO rewritten in place. Nothing was deleted."
+    say "    Backup: $WORKDIR/backup.bundle"
+    say "    Re-clone local copies: git clone $PUSH_URL"
+    exit 0
 fi
 
 # =============================================================================
