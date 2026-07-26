@@ -78,20 +78,36 @@ repo. Nothing is renamed, nothing is deleted, you keep every star.
 declaudify --in-place owner/repo
 ```
 
-The reason this is enough: GitHub's **contributors graph is computed from the
-default branch only**. Pull-request refs never feed it. So if your complaint is
-the orange avatar sitting in your contributors list, a force-push removes it and
-you do not need to replace anything.
+There are **two separate contributor caches**, and they do not clear the same way:
 
-Measured on a throwaway repo: `claude` dropped off the contributors graph
-**371 seconds** after the force-push. Not the 24 to 48 hours the internet will
-tell you.
+| Surface | Cleared by | How long |
+|---|---|---|
+| Insights > Contributors | the force-push | a few minutes |
+| Repo homepage sidebar | a **default-branch toggle** | 60 to 80 seconds |
 
-> **Do not poke it while it recomputes.** In a side-by-side test, the repo left
-> alone cleared in 371s. An identical repo that got an extra commit, a rename and
-> a visibility toggle never finished recomputing at all. Every push, rename or
-> visibility change re-invalidates the cache and restarts the clock. That is
-> almost certainly why people report multi-day waits.
+`--in-place` does both: it force-pushes, then flips the default branch to a
+temporary branch and straight back, which is what flushes the homepage sidebar.
+Then it waits until *both* surfaces actually come back clean before saying done.
+
+Pull-request refs never feed either surface, so replacing the repo is not
+required and no stars are lost.
+
+Measured with no-op control windows, on a clone of a real 200-commit repo:
+
+```
+force-push only, nothing else   ->  sidebar still stale after 919s
+archive + unarchive             ->  no effect
+extra commit on default branch  ->  no effect
+default-branch toggle           ->  sidebar cleared in 61s / 81s / 62s
+```
+
+The widely repeated advice to "wait 24 to 48 hours" is wrong on both counts: the
+sidebar does not clear on its own in any reasonable time, and once you toggle the
+default branch it clears in about a minute.
+
+Note the sidebar is genuinely invisible to the REST API. `/repos/{o}/{r}/contributors`
+omits co-authors entirely, so a repo can look clean there while the homepage still
+shows Claude. declaudify reads the same private `/_sidebar` endpoint the page uses.
 
 **Use the default mode** when you need the old commits genuinely gone, not just
 absent from the graph. A force-push cannot reach `refs/pull/N/head`, so old
@@ -104,7 +120,7 @@ them, and that is what costs you the stars.
 | Off the contributors graph | yes, minutes | yes, immediately |
 | Old commits gone from PR refs | no | yes |
 | Needs `delete_repo` scope | no | yes |
-| Needs admin | no | yes |
+| Needs admin | only to flush the sidebar | yes |
 
 ## Install
 
@@ -179,6 +195,7 @@ stops right before the first prompt. Nothing on GitHub is touched.
 | `-n, --dry-run` | Rewrite locally, change nothing on GitHub |
 | `-y, --yes` | Skip every prompt. You had better be sure |
 | `-v, --verbose` | Show every step instead of just the important ones |
+| `--in-place` | Rewrite the same repo instead of replacing it. Keeps your stars |
 | `--keep-old` | Keep the renamed old repo |
 | `--delete-old` | Delete it without being asked which you want |
 | `--suffix <s>` | Suffix for the renamed old repo (default `.`) |

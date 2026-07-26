@@ -52,6 +52,21 @@ dc_filter_message() {
     '
 }
 
+# True if ANY login in a whitespace-separated list is a Claude identity.
+#
+# Matching the joined list against dc_ident_re directly is a trap: that pattern
+# is anchored for a single identity (^claude$), so a login sitting in the middle
+# of "ParkerrDev claude" never matches and the list reads as clean. That bug
+# made declaudify report success while Claude was still listed.
+dc_list_has_claude() {
+    local item
+    for item in $1; do
+        [[ -n $item ]] || continue
+        if dc_is_claude_identity "$item" "$item"; then return 0; fi
+    done
+    return 1
+}
+
 # True if an identity should be reattributed.
 dc_is_claude_identity() {
     local name email re

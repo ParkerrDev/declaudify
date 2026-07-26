@@ -180,6 +180,7 @@ trap on_exit EXIT
 
 need_cmd git
 need_cmd awk
+need_cmd curl "needed to read the repo homepage sidebar"
 gh_preflight
 detail "git $(git --version | awk '{print $3}'), gh authenticated"
 
@@ -459,37 +460,60 @@ if (( IN_PLACE )); then
     (( $(dc_residual_identity_count "$VERIFY") == 0 ))    || die "Claude identities still present on GitHub"
     ok "verified on GitHub: content identical, no Claude attribution on any branch"
 
-    step "Waiting for the contributors graph"
-    say "    ${C_BOLD}Do not push, rename, or change visibility until this finishes.${C_RESET}"
-    say "    ${C_DIM}Each of those restarts GitHub's recomputation from scratch.${C_RESET}"
+    # The homepage sidebar keeps its own contributor cache that a force-push
+    # does not touch. Toggling the default branch is what flushes it; see the
+    # measurements in lib/github.sh.
+    step "Flushing the homepage sidebar cache"
+    if gh_flush_sidebar_cache "$REPO" "$DEFAULT_BRANCH"; then
+        ok "default branch toggled and restored"
+    else
+        warn "could not toggle the default branch, which needs admin rights."
+        warn "Insights will clear, but the repo homepage sidebar may keep listing"
+        warn "Claude. To fix by hand: Settings > change the default branch to any"
+        warn "other branch, save, then change it back."
+    fi
+
+    step "Waiting for GitHub to recompute"
+    say "    ${C_BOLD}Do not push or change settings until this finishes.${C_RESET}"
+    say "    ${C_DIM}Insights takes a few minutes; the sidebar about a minute after the toggle.${C_RESET}"
 
     graph_t0=$(date +%s)
-    graph_done=0
+    graph_done=0 sidebar_done=0
     for _ in $(seq 1 "${DECLAUDIFY_GRAPH_TRIES:-90}"); do
-        graph=$(gh api "repos/$REPO/stats/contributors" \
-                --jq '[.[] | "\(.author.login)"] | join(" ")' 2>/dev/null || true)
         elapsed=$(( $(date +%s) - graph_t0 ))
-        if [[ -n $graph ]]; then
-            if printf '%s\n' "$graph" | grep -qiE "$(dc_ident_re)"; then
-                detail "${elapsed}s: still listed ($graph)"
-            else
-                ok "Claude left the contributors graph after ${elapsed}s"
-                say "    now: $graph"
+
+        if (( ! graph_done )); then
+            graph=$(gh api "repos/$REPO/stats/contributors" \
+                    --jq '[.[] | "\(.author.login)"] | join(" ")' 2>/dev/null || true)
+            if [[ -n $graph ]] && ! dc_list_has_claude "$graph"; then
+                ok "Insights contributors clean after ${elapsed}s ($graph)"
                 graph_done=1
-                break
+            else
+                detail "${elapsed}s insights: ${graph:-recomputing}"
             fi
-        else
-            detail "${elapsed}s: GitHub is recomputing (HTTP 202)"
         fi
+
+        if (( ! sidebar_done )); then
+            sidebar=$(gh_sidebar_contributors "$REPO" | tr '\n' ' ' || true)
+            if [[ -n $sidebar ]] && ! dc_list_has_claude "$sidebar"; then
+                ok "homepage sidebar clean after ${elapsed}s ($sidebar)"
+                sidebar_done=1
+            else
+                detail "${elapsed}s sidebar:  ${sidebar:-unreadable}"
+            fi
+        fi
+
+        (( graph_done && sidebar_done )) && break
         sleep 10
     done
 
-    if (( ! graph_done )); then
+    if (( ! graph_done || ! sidebar_done )); then
         say ''
-        warn "the graph had not finished recomputing when this gave up watching."
-        warn "That is normal; it usually settles within about ten minutes. Check with:"
+        (( graph_done ))   || warn "Insights had not settled yet when this stopped watching."
+        (( sidebar_done )) || warn "The homepage sidebar had not settled yet when this stopped watching."
+        warn "Both usually finish within about ten minutes. Re-check with:"
         say "        gh api repos/$REPO/stats/contributors --jq '[.[].author.login]'"
-        warn "Do not push anything in the meantime or the clock restarts."
+        say "        open https://github.com/$REPO"
     fi
 
     step "Done"

@@ -356,6 +356,30 @@ is "…and reports zero stars" "$GH_LOSS_STARS" "0"
 
 unset -f gh
 
+suite "contributor-list matching (regression)"
+
+# A joined list must not be matched against the single-identity pattern: the
+# anchored ^claude$ never fires mid-list, which once made declaudify report
+# "sidebar clean (ParkerrDev claude)".
+dc_list_has_claude "ParkerrDev claude" && r=yes || r=no
+is "detects claude in the MIDDLE of a login list" "$r" "yes"
+
+dc_list_has_claude "claude ParkerrDev" && r=yes || r=no
+is "detects claude at the start of a list" "$r" "yes"
+
+dc_list_has_claude "ParkerrDev" && r=yes || r=no
+is "clean list reads as clean" "$r" "no"
+
+dc_list_has_claude "" && r=yes || r=no
+is "empty list reads as clean" "$r" "no"
+
+dc_list_has_claude "ParkerrDev claudia Claudette" && r=yes || r=no
+is "does not false-positive on similar human logins" "$r" "no"
+
+# The old, broken form, kept as an explicit demonstration of why it was wrong.
+printf '%s\n' "ParkerrDev claude" | grep -qiE "$(dc_ident_re)" && r=yes || r=no
+is "the naive joined-string match is indeed blind to this" "$r" "no"
+
 suite "in-place mode"
 
 out=$("$ROOT/declaudify" --help)
@@ -371,7 +395,20 @@ hasnt "in-place block never calls gh_delete" \
    "$(printf '%s' "$src" | sed -n '/^if (( IN_PLACE )); then/,/^fi$/p')" "gh_delete"
 hasnt "in-place block never calls gh_rename" \
    "$(printf '%s' "$src" | sed -n '/^if (( IN_PLACE )); then/,/^fi$/p')" "gh_rename"
-has "in-place warns against nudging the graph" "$src" "restarts GitHub's recomputation"
+has "in-place warns against touching the repo while it settles" "$src" "Do not push or change settings"
+
+# The homepage sidebar is a separate cache from Insights. Measured: a force-push
+# alone left it stale for 919s, while a default-branch toggle cleared it in 61s
+# and 81s across two controlled runs.
+has "in-place flushes the sidebar cache" "$src" "gh_flush_sidebar_cache"
+has "in-place waits on the sidebar too, not just Insights" "$src" "homepage sidebar clean after"
+has "…and explains the manual fallback when not admin" "$src" "change the default branch"
+
+ghsrc=$(cat "$ROOT/lib/github.sh")
+has "flush works by toggling the default branch" "$ghsrc" "default_branch=\$DC_FLUSH_BRANCH"
+has "flush restores the original default branch" "$ghsrc" "default_branch=\$default"
+has "flush cleans up its temporary branch" "$ghsrc" "DELETE \"repos/\$repo/git/refs/heads/\$DC_FLUSH_BRANCH\""
+has "sidebar reader documents why REST is not enough" "$ghsrc" "omits co-authors"
 
 suite "installer"
 
