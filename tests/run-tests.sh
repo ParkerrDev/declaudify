@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# declaudify test suite — no network, no dependencies beyond git/awk.
+# declaudify test suite - no network, no dependencies beyond git/awk.
 #
 # Builds throwaway repositories containing every flavour of Claude attribution
 # (and several things that must NOT be touched), runs the real rewrite passes
@@ -306,6 +306,38 @@ is "…and none remains once PR refs are pruned" "$after_prune" "0"
 is "branches are untouched by that" \
    "$(git -C "$TMP/m3" for-each-ref --format='%(refname)' refs/heads | tr '\n' ' ')" \
    "refs/heads/main "
+
+suite "prompts without a terminal"
+
+# curl ... | sh leaves stdin pointing at the script, so these paths matter.
+DECLAUDIFY_ASSUME_YES=1
+choose picked "Delete or keep?" "delete:remove it" "keep:leave it"
+is "choose falls back to the first option when it cannot prompt" "$picked" "delete"
+
+confirm "auto-confirmed?" >/dev/null 2>&1 && r=ok || r=failed
+is "confirm honours --yes without a tty" "$r" "ok"
+DECLAUDIFY_ASSUME_YES=0
+
+( set +e; DECLAUDIFY_ASSUME_YES=0; confirm "needs a tty?" </dev/null >/dev/null 2>&1 )
+is "confirm refuses rather than assuming yes when it cannot ask" "$?" "1"
+
+suite "installer"
+
+sh -n "$ROOT/install.sh" && r=ok || r=failed
+is "install.sh is valid POSIX sh" "$r" "ok"
+is "install.sh is executable" "$([[ -x $ROOT/install.sh ]] && echo yes || echo no)" "yes"
+has "installer explains missing scopes" "$(cat "$ROOT/install.sh")" "gh auth refresh"
+has "installer supports running straight after install" "$(cat "$ROOT/install.sh")" 'exec "$SHARE/declaudify" "$@"'
+
+suite "no em-dashes anywhere"
+
+# Built from bytes rather than written literally, otherwise this file would
+# contain the very character it is asserting the absence of.
+EMDASH=$(printf '\xe2\x80\x94')
+
+for f in declaudify install.sh lib/common.sh lib/rewrite.sh lib/github.sh tests/run-tests.sh README.md; do
+    is "no em-dash in $f" "$(grep -c "$EMDASH" "$ROOT/$f" 2>/dev/null || true)" "0"
+done
 
 suite "cli surface"
 

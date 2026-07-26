@@ -7,11 +7,11 @@
 # be normalised by GitHub (a trailing "." is not guaranteed to survive), and the
 # id is the only handle that stays valid across one.
 #
-# jq is not a dependency — `gh api --jq` uses gh's built-in jq.
+# jq is not a dependency - `gh api --jq` uses gh's built-in jq.
 
 gh_preflight() {
     need_cmd gh "install from https://cli.github.com"
-    gh auth status >/dev/null 2>&1 || die "gh is not authenticated — run: gh auth login"
+    gh auth status >/dev/null 2>&1 || die "gh is not authenticated - run: gh auth login"
 }
 
 # Space-separated OAuth scopes, or empty if the token type does not expose them
@@ -36,7 +36,7 @@ gh_repo_exists() { gh api "repos/$1" >/dev/null 2>&1; }
 
 gh_repo_field() { gh api "repos/$1" --jq "$2" 2>/dev/null; }
 
-# Authoritative current full_name for a repo id — survives any rename.
+# Authoritative current full_name for a repo id - survives any rename.
 gh_name_by_id() { gh api "repositories/$1" --jq '.full_name' 2>/dev/null; }
 
 # Tab-separated inventory of everything a rename/recreate migration does NOT

@@ -272,7 +272,7 @@ dc_snapshot() {
 
 # Loose, informational: any mention of claude/anthropic still reachable. Expected
 # to be non-zero on repos that legitimately discuss Claude or have a human
-# contributor named Claude — it is reported, never used as a gate.
+# contributor named Claude - it is reported, never used as a gate.
 dc_residual_count() {
     local repo=$1
     { git -C "$repo" log --all --format='%an%n%ae%n%cn%n%ce%n%B' 2>/dev/null || true; } |
@@ -280,7 +280,7 @@ dc_residual_count() {
 }
 
 # Strict: message lines that still match the drop pattern, i.e. real attribution
-# the rewrite failed to remove. This one IS a gate — it must be zero.
+# the rewrite failed to remove. This one IS a gate - it must be zero.
 dc_residual_attribution_count() {
     local repo=$1
     { git -C "$repo" log --all --format='%B' 2>/dev/null || true; } |

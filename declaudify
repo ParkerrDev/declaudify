@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# declaudify — strip Claude attribution from a GitHub repo's history, without
+# declaudify - strip Claude attribution from a GitHub repo's history, without
 # leaving the old commits reachable anywhere on GitHub.
 #
 # A force-push is not enough: GitHub keeps pull-request refs (refs/pull/N/head)
@@ -45,6 +45,7 @@ source "$SELF_DIR/lib/github.sh"
 
 SUFFIX='.'
 KEEP_OLD=0
+KEEP_OLD_SET=0
 PREVIEW_LIMIT=10
 WORKDIR=''
 TARGET=''
@@ -53,7 +54,7 @@ DECLAUDIFY_NEW_EMAIL=''
 
 usage() {
     cat <<'EOF'
-declaudify — remove Claude attribution from a GitHub repo's entire history
+declaudify - remove Claude attribution from a GitHub repo's entire history
 
 USAGE
     declaudify [options] <owner/repo | github url>
@@ -68,7 +69,9 @@ OPTIONS
     -n, --dry-run          Clone and rewrite locally, show what would change,
                            and touch nothing on GitHub. Always run this first.
     -y, --yes              Skip confirmation prompts. Dangerous by design.
-        --keep-old         Do everything except deleting the renamed old repo.
+        --keep-old         Keep the renamed old repo instead of deleting it.
+        --delete-old       Delete the old repo without being asked which to do.
+                           Without either flag you are asked interactively.
         --suffix <s>       Suffix for the renamed old repo (default: ".").
         --name <name>      Author name to reattribute Claude commits to.
         --email <email>    Author email to reattribute Claude commits to.
@@ -104,7 +107,8 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         -n|--dry-run)      DECLAUDIFY_DRY_RUN=1 ;;
         -y|--yes)          DECLAUDIFY_ASSUME_YES=1 ;;
-        --keep-old)        KEEP_OLD=1 ;;
+        --keep-old)        KEEP_OLD=1; KEEP_OLD_SET=1 ;;
+        --delete-old)      KEEP_OLD=0; KEEP_OLD_SET=1 ;;
         --suffix)          SUFFIX=${2:?--suffix needs a value}; shift ;;
         --name)            DECLAUDIFY_NEW_NAME=${2:?--name needs a value}; shift ;;
         --email)           DECLAUDIFY_NEW_EMAIL=${2:?--email needs a value}; shift ;;
@@ -185,28 +189,64 @@ CLONE_URL=$(gh_repo_field "$REPO" '.clone_url')
 ok "$REPO (id $REPO_ID, $VISIBILITY, default branch: $DEFAULT_BRANCH)"
 
 [[ $IS_ADMIN == true ]] || die "you need admin rights on $REPO to rename and delete it"
-[[ $IS_ARCHIVED == true ]] && die "$REPO is archived — unarchive it first"
+[[ $IS_ARCHIVED == true ]] && die "$REPO is archived - unarchive it first"
 [[ $IS_FORK == true ]] && warn "$REPO is a fork; the replacement will be a standalone repo, not a fork"
 
 if gh_repo_exists "$OWNER/$OLD_NAME"; then
-    die "$OWNER/$OLD_NAME already exists — pick another --suffix"
+    die "$OWNER/$OLD_NAME already exists - pick another --suffix"
 fi
 
-# Check the delete scope NOW, not after the repo has been renamed.
-if (( ! KEEP_OLD )) && [[ $DECLAUDIFY_DRY_RUN == 0 ]]; then
-    if ! gh_has_scope delete_repo; then
-        if [[ -z $(gh_token_scopes) ]]; then
-            warn "cannot read token scopes (fine-grained PAT?); deletion may fail"
+# Check token scopes NOW, never after the repo has been renamed. A missing scope
+# discovered halfway through would leave the repo stranded under its temporary
+# name, so this either fixes the plan or stops before anything moves.
+CAN_DELETE=1
+SCOPES=$(gh_token_scopes)
+
+if [[ $DECLAUDIFY_DRY_RUN == 0 ]]; then
+    if [[ -z $SCOPES ]]; then
+        warn "cannot read your token's scopes (fine-grained PAT or GitHub App token)."
+        warn "declaudify will continue, but a missing permission will only show up"
+        warn "when the matching step runs. A classic token avoids the guesswork:"
+        warn "    gh auth login  (choose 'classic' when asked about the token type)"
+    else
+        if ! gh_has_scope repo; then
+            die "your gh token lacks the 'repo' scope, which is needed to rename and
+       create repositories. Fix it with:
+
+           gh auth refresh -h github.com -s repo
+
+       Current scopes: $SCOPES"
+        fi
+        ok "'repo' scope present"
+
+        if ! gh_has_scope delete_repo; then
+            CAN_DELETE=0
+            say ''
+            warn "your gh token lacks the 'delete_repo' scope, so the old repo cannot"
+            warn "be deleted. Fix it with:"
+            say ''
+            say "        ${C_BOLD}gh auth refresh -h github.com -s delete_repo${C_RESET}"
+            say ''
+            warn "Current scopes: $SCOPES"
         else
-            die "your gh token lacks the delete_repo scope, so step 6 would fail after
-       the repo had already been renamed and replaced. Fix it first:
-
-           gh auth refresh -h github.com -s delete_repo
-
-       Or re-run with --keep-old to skip deletion."
+            ok "'delete_repo' scope present"
         fi
     fi
-    ok "delete_repo scope present"
+fi
+
+# Without the scope the only workable plan is to keep the renamed repo, so say
+# that plainly rather than failing at the last step.
+if (( ! CAN_DELETE )) && (( ! KEEP_OLD )); then
+    if [[ $DECLAUDIFY_ASSUME_YES == 1 ]] || ! has_tty; then
+        die "cannot delete the old repo without the delete_repo scope.
+       Add the scope with the command above, or pass --keep-old."
+    fi
+    choose scope_choice "How do you want to proceed?" \
+        "keep:migrate now and keep the old repo (you can delete it yourself later)" \
+        "abort:stop here so you can add the delete_repo scope first"
+    [[ $scope_choice == keep ]] || die "aborted so you can run: gh auth refresh -h github.com -s delete_repo"
+    KEEP_OLD=1
+    ok "continuing; the old repo will be kept"
 fi
 
 # =============================================================================
@@ -232,7 +272,7 @@ ok "backup bundle: $WORKDIR/backup.bundle"
 
 # Scan BEFORE pruning. Attribution frequently survives only in refs/pull/*,
 # which is exactly what a force-push cannot reach and what this migration exists
-# to purge — pruning first would report "nothing to do" and leave it live on
+# to purge - pruning first would report "nothing to do" and leave it live on
 # GitHub forever.
 dc_scan "$MIRROR"
 PR_ATTR=$(( DC_SCAN_MSG_COUNT + DC_SCAN_IDENT_COUNT ))
@@ -256,7 +296,7 @@ say "    commit messages with attribution lines : $DC_SCAN_MSG_COUNT"
 say "    commits authored/committed by Claude   : $DC_SCAN_IDENT_COUNT"
 say "    annotated tags needing a rewrite       : $DC_SCAN_TAG_COUNT"
 
-# Attribution reachable only from the refs we just pruned — pull-request refs.
+# Attribution reachable only from the refs we just pruned - pull-request refs.
 # Rewriting cannot touch these; only replacing the repository removes them.
 PR_ONLY=$(( PR_ATTR - DC_SCAN_MSG_COUNT - DC_SCAN_IDENT_COUNT ))
 (( PR_ONLY < 0 )) && PR_ONLY=0
@@ -264,14 +304,14 @@ say "    attributed commits in pull-request refs : $PR_ONLY"
 
 if (( DC_SCAN_TOTAL == 0 && PR_ONLY == 0 )); then
     say ''
-    ok "no Claude attribution found in $REPO — nothing to do"
+    ok "no Claude attribution found in $REPO - nothing to do"
     exit 0
 fi
 
 if (( DC_SCAN_TOTAL == 0 )); then
     say ''
     warn "branches and tags are already clean, but $PR_ONLY attributed commit(s)"
-    warn "survive in pull-request refs. A force-push cannot remove those — only"
+    warn "survive in pull-request refs. A force-push cannot remove those - only"
     warn "replacing the repository can, which is what this run will do."
 fi
 
@@ -308,7 +348,7 @@ if (( DC_SCAN_TOTAL > 0 )); then
     ok "dropped $dropped refs/original backup ref(s)"
     dc_gc "$MIRROR"
 else
-    info "branches and tags need no rewriting — migrating them unchanged"
+    info "branches and tags need no rewriting - migrating them unchanged"
 fi
 
 # --- integrity gate ---
@@ -316,21 +356,21 @@ SNAP_AFTER=$(dc_snapshot "$MIRROR")
 
 if [[ $(printf '%s\n' "$SNAP_BEFORE" | awk '{print $1}') != \
       $(printf '%s\n' "$SNAP_AFTER"  | awk '{print $1}') ]]; then
-    die "ref set changed during rewrite — refusing to continue"
+    die "ref set changed during rewrite - refusing to continue"
 fi
 if [[ $(printf '%s\n' "$SNAP_BEFORE" | awk '{print $1, $2, $3}') != \
       $(printf '%s\n' "$SNAP_AFTER"  | awk '{print $1, $2, $3}') ]]; then
     say ''
     diff <(printf '%s\n' "$SNAP_BEFORE") <(printf '%s\n' "$SNAP_AFTER") >&2 || true
-    die "file content or commit count changed during rewrite — refusing to continue"
+    die "file content or commit count changed during rewrite - refusing to continue"
 fi
 ok "content verified identical: every ref has the same tree and commit count"
 
 # Hard gates: no attribution line and no Claude identity may survive.
 left_attr=$(dc_residual_attribution_count "$MIRROR")
 left_ident=$(dc_residual_identity_count "$MIRROR")
-(( left_attr == 0 ))  || die "$left_attr attribution line(s) survived the rewrite — refusing to continue"
-(( left_ident == 0 )) || die "$left_ident commit(s) are still attributed to Claude — refusing to continue"
+(( left_attr == 0 ))  || die "$left_attr attribution line(s) survived the rewrite - refusing to continue"
+(( left_ident == 0 )) || die "$left_ident commit(s) are still attributed to Claude - refusing to continue"
 ok "no attribution lines and no Claude identities remain"
 
 # Soft signal: ordinary prose that happens to mention Claude is left alone by
@@ -338,7 +378,7 @@ ok "no attribution lines and no Claude identities remain"
 residual=$(dc_residual_count "$MIRROR")
 if (( residual > 0 )); then
     info "$residual line(s) still mention claude/anthropic in prose or in a human"
-    info "contributor's name — left untouched on purpose. Review if unexpected:"
+    info "contributor's name - left untouched on purpose. Review if unexpected:"
     info "    git -C $MIRROR log --all"
 fi
 
@@ -354,14 +394,30 @@ fi
 # Confirmation
 # =============================================================================
 
+# Let the user pick what happens to the old repo, rather than making deletion an
+# invisible default they only notice afterwards.
+if (( ! KEEP_OLD_SET )) && (( CAN_DELETE )); then
+    choose old_repo_plan \
+        "Once the new repo is verified, what should happen to the old one?" \
+        "delete:delete $OWNER/$OLD_NAME permanently, so the old commits are gone from GitHub" \
+        "keep:keep it as $OWNER/$OLD_NAME so you can check it first and delete it yourself"
+    if [[ $old_repo_plan == keep ]]; then KEEP_OLD=1; fi
+fi
+
 step "About to replace $REPO on GitHub"
 say "    1. rename  $REPO  ->  $OWNER/$OLD_NAME"
 say "    2. create  $REPO  (fresh, $VISIBILITY)"
 say "    3. push    $COMMITS commits, $BRANCHES branch(es), $TAGS tag(s)"
 if (( KEEP_OLD )); then
-    say "    4. verify, then KEEP $OWNER/$OLD_NAME (--keep-old)"
+    say "    4. verify, then KEEP $OWNER/$OLD_NAME"
+    say ''
+    say "    ${C_YELLOW}note:${C_RESET} keeping the old repo means the Claude commits stay on GitHub"
+    say "    until you delete it yourself: ${C_BOLD}gh repo delete $OWNER/$OLD_NAME${C_RESET}"
 else
-    say "    4. verify, then ${C_RED}DELETE $OWNER/$OLD_NAME permanently${C_RESET}"
+    say "    4. verify, then ${C_RED}${C_BOLD}DELETE $OWNER/$OLD_NAME PERMANENTLY${C_RESET}"
+    say ''
+    say "    ${C_RED}Deleting a repository cannot be undone.${C_RESET} Everything listed below"
+    say "    goes with it, and only a fresh clone of the new repo will remain."
 fi
 say ''
 say "    ${C_YELLOW}this does not carry over:${C_RESET}"
@@ -419,7 +475,7 @@ ok "created $REPO (id $NEW_ID)"
 step "4. Pushing rewritten history"
 PUSH_URL="https://github.com/$REPO.git"
 git -C "$MIRROR" push --mirror --quiet "$PUSH_URL" ||
-    die "push failed — the old repo is still intact at $ACTUAL_OLD"
+    die "push failed - the old repo is still intact at $ACTUAL_OLD"
 ok "pushed all branches and tags"
 
 gh_set_default_branch "$REPO" "$DEFAULT_BRANCH"
@@ -440,13 +496,13 @@ SNAP_REMOTE=$(dc_snapshot "$VERIFY")
 if [[ $SNAP_REMOTE != "$SNAP_AFTER" ]]; then
     say ''
     diff <(printf '%s\n' "$SNAP_AFTER") <(printf '%s\n' "$SNAP_REMOTE") >&2 || true
-    die "the pushed repo does not match the rewritten history — NOT deleting anything"
+    die "the pushed repo does not match the rewritten history - NOT deleting anything"
 fi
 ok "all refs, trees and commit counts match the rewritten history"
 
 if [[ $(printf '%s\n' "$SNAP_BEFORE" | awk '{print $1, $2, $3}') != \
       $(printf '%s\n' "$SNAP_REMOTE" | awk '{print $1, $2, $3}') ]]; then
-    die "the pushed repo's content differs from the original — NOT deleting anything"
+    die "the pushed repo's content differs from the original - NOT deleting anything"
 fi
 ok "content on GitHub is identical to the original repo"
 
@@ -459,8 +515,8 @@ ok "$verify_commits commits present"
 # we believe we pushed. This is the last check before anything is deleted.
 remote_attr=$(dc_residual_attribution_count "$VERIFY")
 remote_ident=$(dc_residual_identity_count "$VERIFY")
-(( remote_attr == 0 ))  || die "$remote_attr attribution line(s) present on GitHub — NOT deleting anything"
-(( remote_ident == 0 )) || die "$remote_ident Claude-attributed commit(s) on GitHub — NOT deleting anything"
+(( remote_attr == 0 ))  || die "$remote_attr attribution line(s) present on GitHub - NOT deleting anything"
+(( remote_ident == 0 )) || die "$remote_ident Claude-attributed commit(s) on GitHub - NOT deleting anything"
 ok "no Claude attribution present on GitHub"
 
 # =============================================================================
@@ -473,7 +529,10 @@ if (( KEEP_OLD )); then
     rollback_clear
 else
     step "6. Deleting $ACTUAL_OLD"
-    confirm "Verification passed. Permanently delete $ACTUAL_OLD?" "delete"
+    say "    $REPO is verified and complete, so the old copy is no longer needed."
+    say "    ${C_RED}${C_BOLD}This deletes https://github.com/$ACTUAL_OLD for good and cannot be undone.${C_RESET}"
+    say "    Your pre-rewrite backup stays at $WORKDIR/backup.bundle"
+    confirm "Delete $ACTUAL_OLD permanently?" "delete"
     gh_delete "$ACTUAL_OLD"
     ok "deleted $ACTUAL_OLD"
     rollback_clear

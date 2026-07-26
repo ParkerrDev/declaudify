@@ -43,32 +43,93 @@ mutate() {
     "$@"
 }
 
+# True when there is some terminal we can prompt on.
+has_tty() { [[ -t 0 ]] || [[ -r /dev/tty ]]; }
+
+# Read one line from the user into the named variable.
+#
+# When declaudify is run through a pipe (curl ... | sh) stdin is the script
+# itself, so prompts have to come from /dev/tty instead. Getting this wrong
+# means a destructive prompt silently reads a line of shell source and treats
+# it as the answer, so it is handled here once for every prompt in the tool.
+ask() {
+    local __var=$1 __prompt=$2 __line
+    printf '%s' "$__prompt" >&2
+    if [[ -t 0 ]]; then
+        IFS= read -r __line || return 1
+    elif [[ -r /dev/tty ]]; then
+        IFS= read -r __line < /dev/tty || return 1
+    else
+        return 1
+    fi
+    printf -v "$__var" '%s' "$__line"
+    return 0
+}
+
 # Ask for confirmation. With `expect` set, the user must type that exact string
-# (used for the destructive steps so muscle-memory "y" cannot trigger a delete).
+# (used for the destructive steps so a muscle-memory "y" cannot trigger a
+# delete).
 confirm() {
     local prompt=$1 expect=${2:-}
-    local reply
+    local reply=''
 
     if [[ $DECLAUDIFY_ASSUME_YES == 1 ]]; then
         info "auto-confirmed (--yes): $prompt"
         return 0
     fi
 
-    if [[ ! -t 0 ]]; then
-        die "$prompt — refusing to continue without a terminal to confirm on. Re-run with --yes if you are sure."
+    if ! has_tty; then
+        die "$prompt
+       There is no terminal to confirm on. Re-run with --yes if you are sure."
     fi
 
     if [[ -n $expect ]]; then
         printf '\n%s%s%s\n' "$C_BOLD" "$prompt" "$C_RESET" >&2
-        printf 'Type %s%s%s to continue (anything else aborts): ' "$C_BOLD" "$expect" "$C_RESET" >&2
-        read -r reply
+        ask reply "$(printf 'Type %s%s%s to continue (anything else aborts): ' \
+                     "$C_BOLD" "$expect" "$C_RESET")" || die "aborted (could not read a reply)"
         [[ $reply == "$expect" ]] || die "aborted (expected \"$expect\", got \"$reply\")"
     else
-        printf '\n%s%s%s [y/N] ' "$C_BOLD" "$prompt" "$C_RESET" >&2
-        read -r reply
+        ask reply "$(printf '\n%s%s%s [y/N] ' "$C_BOLD" "$prompt" "$C_RESET")" ||
+            die "aborted (could not read a reply)"
         [[ $reply == [yY] || $reply == [yY][eE][sS] ]] || die "aborted"
     fi
     return 0
+}
+
+# Ask a multiple-choice question. Sets the named variable to the chosen key.
+# Usage: choose VAR "question" "key1:description" "key2:description" ...
+choose() {
+    local __var=$1 __question=$2; shift 2
+    local __opt __key __desc __reply __default=''
+
+    if [[ $DECLAUDIFY_ASSUME_YES == 1 ]] || ! has_tty; then
+        __default=${1%%:*}
+        printf -v "$__var" '%s' "$__default"
+        info "defaulting to \"$__default\" (no prompt available)"
+        return 0
+    fi
+
+    local __keys=''
+    printf '\n%s%s%s\n' "$C_BOLD" "$__question" "$C_RESET" >&2
+    for __opt in "$@"; do
+        __key=${__opt%%:*}
+        __desc=${__opt#*:}
+        __keys="${__keys:+$__keys/}$__key"
+        printf '    %s%s%s  %s\n' "$C_BOLD" "$__key" "$C_RESET" "$__desc" >&2
+    done
+
+    while true; do
+        ask __reply "$(printf 'Choose [%s]: ' "$__keys")" ||
+            die "aborted (could not read a reply)"
+        for __opt in "$@"; do
+            __key=${__opt%%:*}
+            if [[ $__reply == "$__key" ]]; then
+                printf -v "$__var" '%s' "$__key"
+                return 0
+            fi
+        done
+        warn "please answer with one of the listed options"
+    done
 }
 
 # --- rollback ----------------------------------------------------------------
@@ -98,7 +159,7 @@ rollback_run() {
         if eval "${ROLLBACK_CMDS[i]}" >/dev/null 2>&1; then
             ok "undone"
         else
-            bad "rollback command failed — you may need to finish this by hand:"
+            bad "rollback command failed - you may need to finish this by hand:"
             say "        ${ROLLBACK_CMDS[i]}"
         fi
     done
