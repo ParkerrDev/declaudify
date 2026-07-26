@@ -307,55 +307,6 @@ is "branches are untouched by that" \
    "$(git -C "$TMP/m3" for-each-ref --format='%(refname)' refs/heads | tr '\n' ' ')" \
    "refs/heads/main "
 
-suite "prompts without a terminal"
-
-# curl ... | sh leaves stdin pointing at the script, so these paths matter.
-DECLAUDIFY_ASSUME_YES=1
-choose picked "Delete or keep?" "delete:remove it" "keep:leave it"
-is "choose falls back to the first option when it cannot prompt" "$picked" "delete"
-
-confirm "auto-confirmed?" >/dev/null 2>&1 && r=ok || r=failed
-is "confirm honours --yes without a tty" "$r" "ok"
-DECLAUDIFY_ASSUME_YES=0
-
-( set +e; DECLAUDIFY_ASSUME_YES=0; confirm "needs a tty?" </dev/null >/dev/null 2>&1 )
-is "confirm refuses rather than assuming yes when it cannot ask" "$?" "1"
-
-suite "what-you-lose summary"
-
-# Stub gh so the inventory can be tested without touching the network.
-# jq field order is: issues, stars, forks, watchers, wiki, pages
-source "$ROOT/lib/github.sh"
-_stub_gh() {
-    local fields=$1 releases=$2
-    eval "gh() {
-        case \"\$*\" in
-            *releases*) printf '%s\n' '$releases' ;;
-            *)          printf '%s\n' '$fields' ;;
-        esac
-    }"
-}
-
-_stub_gh "$(printf '2\t4\t1\t5\ttrue\tfalse')" 3
-GH_LOSS_LIST='' GH_LOSS_STARS=0
-gh_inventory "who/what"
-is "counts stars separately so they can be shouted about" "$GH_LOSS_STARS" "4"
-is "lists losses in plain English, stars excluded" "$GH_LOSS_LIST" \
-   "1 fork, 5 watchers, 2 open issues and PRs, 3 releases, the wiki"
-
-_stub_gh "$(printf '0\t1\t0\t1\tfalse\tfalse')" 0
-GH_LOSS_LIST='' GH_LOSS_STARS=0
-gh_inventory "who/what"
-is "singular forms read correctly" "$GH_LOSS_LIST" "1 watcher"
-
-_stub_gh "$(printf '0\t0\t0\t0\tfalse\tfalse')" 0
-GH_LOSS_LIST='x' GH_LOSS_STARS=9
-gh_inventory "who/what"
-is "an empty repo loses nothing" "$GH_LOSS_LIST" ""
-is "…and reports zero stars" "$GH_LOSS_STARS" "0"
-
-unset -f gh
-
 suite "contributor-list matching (regression)"
 
 # A joined list must not be matched against the single-identity pattern: the
@@ -380,35 +331,49 @@ is "does not false-positive on similar human logins" "$r" "no"
 printf '%s\n' "ParkerrDev claude" | grep -qiE "$(dc_ident_re)" && r=yes || r=no
 is "the naive joined-string match is indeed blind to this" "$r" "no"
 
-suite "in-place mode"
+suite "prompts without a terminal"
 
-out=$("$ROOT/declaudify" --help)
-has "--in-place is documented" "$out" "--in-place"
-has "…and says it keeps stars" "$out" "Keeps stars"
-has "…and is honest about what it leaves behind" "$out" "PR refs"
+# curl ... | sh leaves stdin pointing at the script, so these paths matter.
+DECLAUDIFY_ASSUME_YES=1
+confirm "auto-confirmed?" >/dev/null 2>&1 && r=ok || r=failed
+is "confirm honours --yes without a tty" "$r" "ok"
+DECLAUDIFY_ASSUME_YES=0
 
-# The mode must never reach the rename/create/delete path.
+( set +e; DECLAUDIFY_ASSUME_YES=0; confirm "needs a tty?" </dev/null >/dev/null 2>&1 )
+is "confirm refuses rather than assuming yes when it cannot ask" "$?" "1"
+
+suite "rewrites in place, never replaces"
+
 src=$(cat "$ROOT/declaudify")
-has "in-place forces keep-old so nothing is deleted" "$src" "KEEP_OLD=1"
-has "in-place exits before the replacement plan" "$src" 'say "    Re-clone local copies: git clone $PUSH_URL"'
-hasnt "in-place block never calls gh_delete" \
-   "$(printf '%s' "$src" | sed -n '/^if (( IN_PLACE )); then/,/^fi$/p')" "gh_delete"
-hasnt "in-place block never calls gh_rename" \
-   "$(printf '%s' "$src" | sed -n '/^if (( IN_PLACE )); then/,/^fi$/p')" "gh_rename"
-has "in-place warns against touching the repo while it settles" "$src" "Do not push or change settings"
-
-# The homepage sidebar is a separate cache from Insights. Measured: a force-push
-# alone left it stale for 919s, while a default-branch toggle cleared it in 61s
-# and 81s across two controlled runs.
-has "in-place flushes the sidebar cache" "$src" "gh_flush_sidebar_cache"
-has "in-place waits on the sidebar too, not just Insights" "$src" "homepage sidebar clean after"
-has "…and explains the manual fallback when not admin" "$src" "change the default branch"
-
 ghsrc=$(cat "$ROOT/lib/github.sh")
-has "flush works by toggling the default branch" "$ghsrc" "default_branch=\$DC_FLUSH_BRANCH"
+
+# The rename/create/delete flow is gone. Nothing may resurrect it.
+hasnt "never deletes a repository" "$src$ghsrc" "gh repo delete"
+hasnt "never creates a repository" "$src$ghsrc" "gh repo create"
+hasnt "never renames a repository" "$src$ghsrc" "gh_rename"
+hasnt "no suffix option remains" "$src" "--suffix"
+hasnt "no keep-old option remains" "$src" "--keep-old"
+hasnt "does not demand the delete_repo scope" "$src" "delete_repo"
+
+has "force-pushes branches to the same repo" "$src" "refs/heads/*:refs/heads/*"
+has "force-pushes tags too" "$src" "refs/tags/*:refs/tags/*"
+has "says plainly that nothing is deleted" "$src" "nothing is renamed, replaced or deleted"
+
+# Both contributor surfaces, and the mechanism for each.
+has "flushes the homepage sidebar" "$src" "gh_flush_sidebar_cache"
+has "waits on Insights" "$src" "Insights contributors clean after"
+has "waits on the sidebar" "$src" "homepage sidebar clean after"
+has "offers a manual fallback without admin" "$src" "Settings > General > Default branch"
+has "--no-flush can skip the toggle" "$src" "--no-flush"
+
+has "flush toggles the default branch" "$ghsrc" "default_branch=\$DC_FLUSH_BRANCH"
 has "flush restores the original default branch" "$ghsrc" "default_branch=\$default"
-has "flush cleans up its temporary branch" "$ghsrc" "DELETE \"repos/\$repo/git/refs/heads/\$DC_FLUSH_BRANCH\""
-has "sidebar reader documents why REST is not enough" "$ghsrc" "omits co-authors"
+has "flush removes its temporary branch" "$ghsrc" "DELETE \"repos/\$repo/git/refs/heads/\$DC_FLUSH_BRANCH\""
+has "sidebar reader explains why REST is not enough" "$ghsrc" "omits co-authors"
+
+# A stale listing on an already-clean history must still be actionable.
+has "detects a stale listing over a clean history" "$src" "STALE_LISTING"
+has "…and says so rather than exiting" "$src" "history is already clean, but GitHub still credits Claude"
 
 suite "installer"
 
@@ -434,7 +399,8 @@ out=$("$ROOT/declaudify" --version)
 has "--version works" "$out" "declaudify"
 
 out=$("$ROOT/declaudify" --help)
-has "--help documents the data loss" "$out" "WHAT IS LOST"
+has "--help is honest about the cost" "$out" "WHAT IT COSTS"
+has "--help explains the second cache" "$out" "WHY THE EXTRA STEP"
 
 out=$(printf 'S\n\nCo-authored-by: Claude <noreply@anthropic.com>\n' | "$ROOT/declaudify" --__filter-message)
 is "re-entry filter mode works" "$out" "S"

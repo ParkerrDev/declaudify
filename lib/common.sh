@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 #
-# Shared helpers: output, prompts, guarded execution, and rollback bookkeeping.
+# Shared helpers: output, prompts, and guarded execution.
 #
 # Sourced by `declaudify` and by the test suite. Everything here is pure bash
 # with no external dependencies beyond coreutils.
@@ -21,7 +21,6 @@ step() { printf '\n%s==>%s %s%s%s\n' "$C_CYAN$C_BOLD" "$C_RESET" "$C_BOLD" "$*" 
 ok()   { printf '    %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*" >&2; }
 info() { printf '    %s·%s %s\n' "$C_DIM" "$C_RESET" "$*" >&2; }
 warn() { printf '    %s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
-bad()  { printf '    %s✗%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
 
 # Progress chatter that only appears with --verbose. Anything the user has to
 # read, decide on, or act upon is never routed through here.
@@ -102,76 +101,6 @@ confirm() {
         [[ $reply == [yY] || $reply == [yY][eE][sS] ]] || die "aborted"
     fi
     return 0
-}
-
-# Ask a multiple-choice question. Sets the named variable to the chosen key.
-# Usage: choose VAR "question" "key1:description" "key2:description" ...
-choose() {
-    local __var=$1 __question=$2; shift 2
-    local __opt __key __desc __reply __default=''
-
-    if [[ $DECLAUDIFY_ASSUME_YES == 1 ]] || ! has_tty; then
-        __default=${1%%:*}
-        printf -v "$__var" '%s' "$__default"
-        info "defaulting to \"$__default\" (no prompt available)"
-        return 0
-    fi
-
-    local __keys=''
-    printf '\n%s%s%s\n' "$C_BOLD" "$__question" "$C_RESET" >&2
-    for __opt in "$@"; do
-        __key=${__opt%%:*}
-        __desc=${__opt#*:}
-        __keys="${__keys:+$__keys/}$__key"
-        printf '    %s%s%s  %s\n' "$C_BOLD" "$__key" "$C_RESET" "$__desc" >&2
-    done
-
-    while true; do
-        ask __reply "$(printf 'Choose [%s]: ' "$__keys")" ||
-            die "aborted (could not read a reply)"
-        for __opt in "$@"; do
-            __key=${__opt%%:*}
-            if [[ $__reply == "$__key" ]]; then
-                printf -v "$__var" '%s' "$__key"
-                return 0
-            fi
-        done
-        warn "please answer with one of the listed options"
-    done
-}
-
-# --- rollback ----------------------------------------------------------------
-#
-# Steps that change remote state push an undo command here. If the run dies
-# after that point, the undo commands run in reverse order. This is what keeps a
-# half-finished migration from leaving the repo stranded under its renamed name.
-
-ROLLBACK_CMDS=()
-
-# No-op in dry-run: nothing was mutated, so there is nothing to undo.
-rollback_push() {
-    [[ ${DECLAUDIFY_DRY_RUN:-0} == 1 ]] && return 0
-    ROLLBACK_CMDS+=("$1")
-    return 0
-}
-
-rollback_clear() { ROLLBACK_CMDS=(); }
-
-rollback_run() {
-    local i
-    [[ ${#ROLLBACK_CMDS[@]} -gt 0 ]] || return 0
-
-    step "Rolling back"
-    for (( i = ${#ROLLBACK_CMDS[@]} - 1; i >= 0; i-- )); do
-        say "    ${C_DIM}\$ ${ROLLBACK_CMDS[i]}${C_RESET}"
-        if eval "${ROLLBACK_CMDS[i]}" >/dev/null 2>&1; then
-            ok "undone"
-        else
-            bad "rollback command failed - you may need to finish this by hand:"
-            say "        ${ROLLBACK_CMDS[i]}"
-        fi
-    done
-    rollback_clear
 }
 
 # --- misc --------------------------------------------------------------------

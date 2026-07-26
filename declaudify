@@ -1,25 +1,26 @@
 #!/usr/bin/env bash
 #
-# declaudify - strip Claude attribution from a GitHub repo's history, without
-# leaving the old commits reachable anywhere on GitHub.
+# declaudify - remove Claude attribution from a GitHub repo's history, and from
+# the two places GitHub shows it.
 #
-# A force-push is not enough: GitHub keeps pull-request refs (refs/pull/N/head)
-# that a branch push cannot touch, so the original commits stay visible in the
-# PR tab and by SHA. The only way to actually remove them is to replace the
-# repository itself, which is what this does:
+# GitHub renders contributors from two independent caches, and they do not clear
+# the same way:
 #
-#   0. mirror-clone the repo            4. push the rewritten history into it
-#   1. rewrite the history              5. verify the new repo matches
-#   2. rename the old repo to "<name>." 6. delete the old repo
-#   3. create a new repo as "<name>"
+#   Insights > Contributors   cleared by the force-push, a few minutes
+#   Repo homepage sidebar     cleared by toggling the default branch, 60 to 80s
 #
-# Nothing is deleted until step 5 has proved the new repo is byte-identical in
-# content and complete in refs.
+# A force-push alone leaves the homepage sidebar crediting Claude indefinitely:
+# measured stale for 919 seconds with nothing else done to the repo. So this
+# rewrites the history, force-pushes it, then flips the default branch away and
+# back, and waits until both surfaces really come back clean.
+#
+# Your repository is never renamed, replaced or deleted. Stars, issues, pull
+# requests, forks and settings all stay exactly where they are.
 #
 set -euo pipefail
 shopt -s inherit_errexit 2>/dev/null || true
 
-DECLAUDIFY_VERSION=1.0.0
+DECLAUDIFY_VERSION=2.0.0
 
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
 SELF_DIR=$(dirname "$SELF")
@@ -43,43 +44,43 @@ source "$SELF_DIR/lib/github.sh"
 
 # --- defaults ----------------------------------------------------------------
 
-SUFFIX='.'
-IN_PLACE=0
-KEEP_OLD=0
-KEEP_OLD_SET=0
 PREVIEW_LIMIT=10
 WORKDIR=''
 TARGET=''
+NO_FLUSH=0
 DECLAUDIFY_NEW_NAME=''
 DECLAUDIFY_NEW_EMAIL=''
 
 usage() {
     cat <<'EOF'
-declaudify - remove Claude attribution from a GitHub repo's entire history
+declaudify - remove Claude attribution from a GitHub repo
 
 USAGE
     declaudify [options] <owner/repo | github url>
 
 WHAT IT DOES
     Rewrites every commit message, author, committer, annotated tag message and
-    tagger that credits Claude, then migrates the result into a brand-new repo
-    of the same name so no trace survives in pull-request refs. The old repo is
-    renamed out of the way and deleted only after verification passes.
+    tagger that credits Claude, across every branch and tag. Force-pushes the
+    result to your repository, then flushes the homepage sidebar cache and waits
+    until Claude is gone from both contributor lists GitHub shows.
+
+    Your repository is never renamed, replaced or deleted. Stars, issues, pull
+    requests, forks, releases and settings are untouched.
+
+WHY THE EXTRA STEP
+    GitHub has two contributor caches. The force-push clears Insights, but the
+    repo homepage sidebar has its own cache that a push does not touch; it was
+    measured still crediting Claude 919 seconds after a clean force-push.
+    Toggling the default branch away and back clears it in about a minute, so
+    declaudify does that for you.
 
 OPTIONS
     -n, --dry-run          Clone and rewrite locally, show what would change,
                            and touch nothing on GitHub. Always run this first.
-    -y, --yes              Skip confirmation prompts. Dangerous by design.
+    -y, --yes              Skip confirmation prompts.
     -v, --verbose          Show every step instead of just the important ones.
-        --in-place         Rewrite and force-push the SAME repo instead of
-                           replacing it. Keeps stars, issues, PRs and forks,
-                           and clears the contributors graph in a few minutes.
-                           Old commits stay reachable by SHA and in PR refs,
-                           but neither feeds the contributors graph.
-        --keep-old         Keep the renamed old repo instead of deleting it.
-        --delete-old       Delete the old repo without being asked which to do.
-                           Without either flag you are asked interactively.
-        --suffix <s>       Suffix for the renamed old repo (default: ".").
+        --no-flush         Skip the default-branch toggle. Insights will clear,
+                           the homepage sidebar will not.
         --name <name>      Author name to reattribute Claude commits to.
         --email <email>    Author email to reattribute Claude commits to.
                            Both default to the repo's most frequent human author.
@@ -95,17 +96,17 @@ OPTIONS
     -h, --help             This help.
     -V, --version          Version.
 
-WHAT IS LOST
-    THE REPO'S STARS. They cannot be transferred or restored, and the
-    replacement starts at zero. Also lost: issues, pull requests, releases,
-    forks, watchers, wiki, webhooks, deploy keys, branch protection, Actions
-    secrets and Pages settings. declaudify counts exactly what your repo has and
-    shows you before asking to confirm. Code, history, description, homepage,
-    topics, visibility and default branch ARE carried over.
+WHAT IT COSTS
+    Commit SHAs change, so existing clones of the repo need re-cloning. That is
+    the whole cost. Nothing is deleted and nothing is lost.
+
+    Old commits do remain reachable by SHA and inside pull-request refs, which
+    no force-push can reach. Neither feeds a contributor list, so Claude will not
+    appear anywhere GitHub renders contributors, but the objects are still there.
 
 REQUIREMENTS
-    git, gh (authenticated), and the delete_repo token scope:
-        gh auth refresh -h github.com -s delete_repo
+    git, curl, awk, and an authenticated gh with push access. Admin rights are
+    needed only for the default-branch toggle that clears the homepage sidebar.
 EOF
 }
 
@@ -116,10 +117,7 @@ while [[ $# -gt 0 ]]; do
         -n|--dry-run)      DECLAUDIFY_DRY_RUN=1 ;;
         -y|--yes)          DECLAUDIFY_ASSUME_YES=1 ;;
         -v|--verbose)      DECLAUDIFY_VERBOSE=1 ;;
-        --in-place)        IN_PLACE=1 ;;
-        --keep-old)        KEEP_OLD=1; KEEP_OLD_SET=1 ;;
-        --delete-old)      KEEP_OLD=0; KEEP_OLD_SET=1 ;;
-        --suffix)          SUFFIX=${2:?--suffix needs a value}; shift ;;
+        --no-flush)        NO_FLUSH=1 ;;
         --name)            DECLAUDIFY_NEW_NAME=${2:?--name needs a value}; shift ;;
         --email)           DECLAUDIFY_NEW_EMAIL=${2:?--email needs a value}; shift ;;
         --workdir)         WORKDIR=${2:?--workdir needs a value}; shift ;;
@@ -154,21 +152,19 @@ parse_repo() {
 REPO=$(parse_repo "$TARGET")
 OWNER=${REPO%%/*}
 NAME=${REPO##*/}
-OLD_NAME="${NAME}${SUFFIX}"
 
 # --- failure handling --------------------------------------------------------
 
 on_exit() {
     local code=$?
     trap - EXIT
-    if (( code != 0 )); then
-        rollback_run
-        if [[ -n ${WORKDIR:-} && -f $WORKDIR/backup.bundle ]]; then
-            say ''
-            warn "the pre-rewrite history is preserved at:"
-            say "        $WORKDIR/backup.bundle"
-            say "        restore with: git clone $WORKDIR/backup.bundle restored"
-        fi
+    if (( code != 0 )) && [[ -n ${WORKDIR:-} && -f $WORKDIR/backup.bundle ]]; then
+        say ''
+        warn "your original history is preserved at:"
+        say "        $WORKDIR/backup.bundle"
+        say "    restore it with:"
+        say "        git clone --mirror $WORKDIR/backup.bundle restored.git"
+        say "        git -C restored.git push --force https://github.com/$REPO.git 'refs/heads/*:refs/heads/*'"
     fi
     exit "$code"
 }
@@ -186,92 +182,30 @@ detail "git $(git --version | awk '{print $3}'), gh authenticated"
 
 gh_repo_exists "$REPO" || die "repository not found or not visible to you: $REPO"
 
-REPO_ID=$(gh_repo_field "$REPO" '.id')
 DEFAULT_BRANCH=$(gh_repo_field "$REPO" '.default_branch')
 VISIBILITY=$(gh_repo_field "$REPO" '.visibility')
-DESCRIPTION=$(gh_repo_field "$REPO" '.description // ""')
-HOMEPAGE=$(gh_repo_field "$REPO" '.homepage // ""')
-IS_FORK=$(gh_repo_field "$REPO" '.fork')
 IS_ARCHIVED=$(gh_repo_field "$REPO" '.archived')
 IS_ADMIN=$(gh_repo_field "$REPO" '.permissions.admin')
+CAN_PUSH=$(gh_repo_field "$REPO" '.permissions.push')
 CLONE_URL=$(gh_repo_field "$REPO" '.clone_url')
 
-detail "$REPO (id $REPO_ID, $VISIBILITY, default branch: $DEFAULT_BRANCH)"
+detail "$REPO ($VISIBILITY, default branch: $DEFAULT_BRANCH)"
 
-[[ $IS_ARCHIVED == true ]] && die "$REPO is archived - unarchive it first"
+[[ $IS_ARCHIVED == true ]] && die "$REPO is archived, so it cannot be pushed to. Unarchive it first."
+[[ $CAN_PUSH == true ]] || die "you need push access to $REPO"
 
-# In-place only force-pushes, so push access is enough. Replacing the repo needs
-# admin, and needs the renamed-aside name to be free.
-if (( ! IN_PLACE )); then
-    [[ $IS_ADMIN == true ]] || die "you need admin rights on $REPO to rename and delete it.
-       Use --in-place to rewrite it without replacing it."
-    [[ $IS_FORK == true ]] && warn "$REPO is a fork; the replacement will be a standalone repo, not a fork"
-
-    if gh_repo_exists "$OWNER/$OLD_NAME"; then
-        die "$OWNER/$OLD_NAME already exists - pick another --suffix"
-    fi
-fi
-
-# Check token scopes NOW, never after the repo has been renamed. A missing scope
-# discovered halfway through would leave the repo stranded under its temporary
-# name, so this either fixes the plan or stops before anything moves.
-CAN_DELETE=1
-SCOPES=$(gh_token_scopes)
-
-# In-place mode never deletes or renames anything, so it only needs push access.
-if (( IN_PLACE )); then
-    CAN_DELETE=0
-    KEEP_OLD=1
-    KEEP_OLD_SET=1
-elif [[ $DECLAUDIFY_DRY_RUN == 0 ]]; then
-    if [[ -z $SCOPES ]]; then
-        warn "cannot read your token's scopes (fine-grained PAT or GitHub App token)."
-        warn "declaudify will continue, but a missing permission will only show up"
-        warn "when the matching step runs. A classic token avoids the guesswork:"
-        warn "    gh auth login  (choose 'classic' when asked about the token type)"
-    else
-        if ! gh_has_scope repo; then
-            die "your gh token lacks the 'repo' scope, which is needed to rename and
-       create repositories. Fix it with:
-
-           gh auth refresh -h github.com -s repo
-
-       Current scopes: $SCOPES"
-        fi
-        detail "'repo' scope present"
-
-        if ! gh_has_scope delete_repo; then
-            CAN_DELETE=0
-            say ''
-            warn "your gh token lacks the 'delete_repo' scope, so the old repo cannot"
-            warn "be deleted. Fix it with:"
-            say ''
-            say "        ${C_BOLD}gh auth refresh -h github.com -s delete_repo${C_RESET}"
-            say ''
-            warn "Current scopes: $SCOPES"
-        else
-            detail "'delete_repo' scope present"
-        fi
-    fi
-fi
-
-# Without the scope the only workable plan is to keep the renamed repo, so say
-# that plainly rather than failing at the last step.
-if (( ! CAN_DELETE )) && (( ! KEEP_OLD )); then
-    if [[ $DECLAUDIFY_ASSUME_YES == 1 ]] || ! has_tty; then
-        die "cannot delete the old repo without the delete_repo scope.
-       Add the scope with the command above, or pass --keep-old."
-    fi
-    choose scope_choice "How do you want to proceed?" \
-        "keep:migrate now and keep the old repo (you can delete it yourself later)" \
-        "abort:stop here so you can add the delete_repo scope first"
-    [[ $scope_choice == keep ]] || die "aborted so you can run: gh auth refresh -h github.com -s delete_repo"
-    KEEP_OLD=1
-    ok "continuing; the old repo will be kept"
+# The sidebar flush toggles the default branch, which is an admin-only setting.
+CAN_FLUSH=1
+if (( NO_FLUSH )); then
+    CAN_FLUSH=0
+elif [[ $IS_ADMIN != true ]]; then
+    CAN_FLUSH=0
+    warn "you are not an admin of $REPO, so the default branch cannot be toggled."
+    warn "Insights will clear, but the homepage sidebar will keep listing Claude."
 fi
 
 # =============================================================================
-# 0. Clone
+# Clone
 # =============================================================================
 
 if [[ -z $WORKDIR ]]; then
@@ -291,15 +225,10 @@ git -C "$MIRROR" bundle create "$WORKDIR/backup.bundle" --all >/dev/null 2>&1
 git -C "$MIRROR" for-each-ref --format='%(refname) %(objectname)' > "$WORKDIR/refs-before.txt"
 detail "backup bundle: $WORKDIR/backup.bundle"
 
-# Scan BEFORE pruning. Attribution frequently survives only in refs/pull/*,
-# which is exactly what a force-push cannot reach and what this migration exists
-# to purge - pruning first would report "nothing to do" and leave it live on
-# GitHub forever.
-dc_scan "$MIRROR"
-PR_ATTR=$(( DC_SCAN_MSG_COUNT + DC_SCAN_IDENT_COUNT ))
-
+# Only branches, tags and notes are ours to rewrite. refs/pull/* is read-only on
+# GitHub and the push would be rejected.
 pruned=$(dc_prune_foreign_refs "$MIRROR")
-(( pruned > 0 )) && detail "pruned $pruned ref(s) outside refs/heads, refs/tags, refs/notes"
+(( pruned > 0 )) && detail "ignored $pruned ref(s) outside refs/heads, refs/tags, refs/notes"
 
 SNAP_BEFORE=$(dc_snapshot "$MIRROR")
 BRANCHES=$(git -C "$MIRROR" for-each-ref --format='%(refname)' refs/heads | wc -l | tr -d ' ')
@@ -309,31 +238,39 @@ REPO_SIZE="$(plural "$COMMITS" commit), $(plural "$BRANCHES" branch branches), $
 say "    $VISIBILITY, $REPO_SIZE"
 
 # =============================================================================
-# 1. Rewrite
+# Scan
 # =============================================================================
 
 dc_scan "$MIRROR"
+detail "messages: $DC_SCAN_MSG_COUNT, identities: $DC_SCAN_IDENT_COUNT, tags: $DC_SCAN_TAG_COUNT"
 
-# Attribution reachable only from the refs we just pruned, i.e. pull-request
-# refs. Rewriting cannot touch these; only replacing the repository removes them.
-PR_ONLY=$(( PR_ATTR - DC_SCAN_MSG_COUNT - DC_SCAN_IDENT_COUNT ))
-(( PR_ONLY < 0 )) && PR_ONLY=0
+# A repo can have a perfectly clean history and still be credited to Claude,
+# because both contributor caches lag behind the git data. Check them before
+# concluding there is nothing to do.
+SIDEBAR_NOW=$(gh_sidebar_contributors "$REPO" | tr '\n' ' ' || true)
+GRAPH_NOW=$(gh api "repos/$REPO/stats/contributors" --jq '[.[].author.login] | join(" ")' 2>/dev/null || true)
+STALE_LISTING=0
+dc_list_has_claude "$SIDEBAR_NOW" && STALE_LISTING=1
+dc_list_has_claude "$GRAPH_NOW"   && STALE_LISTING=1
 
-detail "messages: $DC_SCAN_MSG_COUNT, identities: $DC_SCAN_IDENT_COUNT, tags: $DC_SCAN_TAG_COUNT, PR refs: $PR_ONLY"
-
-if (( DC_SCAN_TOTAL == 0 && PR_ONLY == 0 )); then
-    ok "no Claude attribution anywhere. Nothing to do."
+if (( DC_SCAN_TOTAL == 0 && ! STALE_LISTING )); then
+    ok "no Claude attribution in the history or the contributor lists. Nothing to do."
     exit 0
 fi
 
 if (( DC_SCAN_TOTAL > 0 )); then
-    say "    found $(plural "$DC_SCAN_TOTAL" item) to rewrite$( (( PR_ONLY > 0 )) && printf ', plus %s in pull-request refs' "$PR_ONLY")"
+    say "    found $(plural "$DC_SCAN_TOTAL" item) to rewrite"
 else
     say ''
-    warn "Branches and tags are already clean. Pull-request refs still hold"
-    warn "$(plural "$PR_ONLY" commit) with Claude attribution, which a force-push cannot"
-    warn "reach. Replacing the repository is the only thing that removes them."
+    warn "The history is already clean, but GitHub still credits Claude:"
+    [[ -n $SIDEBAR_NOW ]] && warn "  homepage sidebar: $SIDEBAR_NOW"
+    [[ -n $GRAPH_NOW   ]] && warn "  insights:         $GRAPH_NOW"
+    warn "This run will refresh both."
 fi
+
+# =============================================================================
+# Rewrite
+# =============================================================================
 
 # Reattribution identity: the repo's most frequent non-Claude author.
 if [[ -z $DECLAUDIFY_NEW_NAME || -z $DECLAUDIFY_NEW_EMAIL ]]; then
@@ -363,210 +300,48 @@ fi
 if (( DC_SCAN_TOTAL > 0 )); then
     dc_rewrite_commits "$MIRROR" "$SELF"
     detail "commit messages and identities rewritten"
-
     tags_done=$(dc_rewrite_tags "$MIRROR")
     detail "$tags_done annotated tag(s) rebuilt"
-
     dropped=$(dc_drop_original_refs "$MIRROR")
     detail "dropped $dropped refs/original backup ref(s)"
     dc_gc "$MIRROR"
 else
-    detail "branches and tags need no rewriting, migrating them unchanged"
+    detail "history needs no rewriting; refreshing the listings only"
 fi
 
 # --- integrity gate ---
+# A history rewrite must change metadata and nothing else. If any ref's tree or
+# commit count moved, something ate real content, so stop before pushing.
 SNAP_AFTER=$(dc_snapshot "$MIRROR")
-
-if [[ $(printf '%s\n' "$SNAP_BEFORE" | awk '{print $1}') != \
-      $(printf '%s\n' "$SNAP_AFTER"  | awk '{print $1}') ]]; then
-    die "ref set changed during rewrite - refusing to continue"
-fi
 if [[ $(printf '%s\n' "$SNAP_BEFORE" | awk '{print $1, $2, $3}') != \
       $(printf '%s\n' "$SNAP_AFTER"  | awk '{print $1, $2, $3}') ]]; then
     say ''
     diff <(printf '%s\n' "$SNAP_BEFORE") <(printf '%s\n' "$SNAP_AFTER") >&2 || true
-    die "file content or commit count changed during rewrite - refusing to continue"
+    die "file content or commit count changed during rewrite, refusing to push"
 fi
 detail "content verified identical: every ref has the same tree and commit count"
 
-# Hard gates: no attribution line and no Claude identity may survive.
 left_attr=$(dc_residual_attribution_count "$MIRROR")
 left_ident=$(dc_residual_identity_count "$MIRROR")
-(( left_attr == 0 ))  || die "$left_attr attribution line(s) survived the rewrite - refusing to continue"
-(( left_ident == 0 )) || die "$left_ident commit(s) are still attributed to Claude - refusing to continue"
+(( left_attr == 0 ))  || die "$left_attr attribution line(s) survived the rewrite, refusing to push"
+(( left_ident == 0 )) || die "$left_ident commit(s) are still attributed to Claude, refusing to push"
 detail "no attribution lines and no Claude identities remain"
 
-# Soft signal: ordinary prose that happens to mention Claude is left alone by
-# design, so this is reported rather than treated as a failure.
 residual=$(dc_residual_count "$MIRROR")
-if (( residual > 0 )); then
-    detail "$residual line(s) mention claude/anthropic in prose or a human name, left alone"
-fi
+(( residual > 0 )) && detail "$residual line(s) mention claude/anthropic in prose or a human name, left alone"
 
 # =============================================================================
-# In-place mode: rewrite and force-push, keeping the repository
-# =============================================================================
-#
-# GitHub's contributors graph is computed from the DEFAULT BRANCH only, so a
-# force-push is enough to drop Claude from it. Pull-request refs keep the old
-# commits fetchable by SHA, but they never feed the graph, which is why this
-# mode does not need to replace the repository and costs no stars.
-#
-# Measured on a throwaway repo: the graph cleared 371 seconds after the push.
-# Nudging it (another push, a rename, a visibility toggle) re-invalidates the
-# cache and restarts the computation, so this mode deliberately does nothing
-# after the push except watch.
-
-if (( IN_PLACE )); then
-    step "This rewrites $REPO in place"
-    say "    force-push $REPO_SIZE to $OWNER/$NAME"
-    say "    the repository, its stars, issues, PRs and forks all stay put"
-    say ''
-    say "    ${C_YELLOW}Commit SHAs change,${C_RESET} so existing clones need re-cloning."
-    say "    ${C_DIM}Old commits stay reachable by SHA and in pull-request refs, but${C_RESET}"
-    say "    ${C_DIM}neither feeds the contributors graph. Use the default mode if you${C_RESET}"
-    say "    ${C_DIM}need them gone entirely.${C_RESET}"
-
-    if [[ $DECLAUDIFY_DRY_RUN == 1 ]]; then
-        step "Dry run: nothing on GitHub was touched"
-        say "    Rewritten mirror: $MIRROR"
-        say "    Backup bundle:    $WORKDIR/backup.bundle"
-        exit 0
-    fi
-
-    confirm "Force-push the rewritten history to $REPO?" "$NAME"
-
-    step "Rewriting in place"
-    PUSH_URL="https://github.com/$REPO.git"
-    git -C "$MIRROR" push --force --quiet "$PUSH_URL" 'refs/heads/*:refs/heads/*' ||
-        die "push failed; $REPO is unchanged"
-    git -C "$MIRROR" push --force --quiet "$PUSH_URL" 'refs/tags/*:refs/tags/*' 2>/dev/null || true
-    ok "force-pushed $REPO_SIZE"
-
-    VERIFY="$WORKDIR/verify.git"
-    rm -rf "$VERIFY"
-    git clone --quiet --mirror "$PUSH_URL" "$VERIFY"
-    dc_prune_foreign_refs "$VERIFY" >/dev/null
-
-    if [[ $(dc_snapshot "$VERIFY") != "$SNAP_AFTER" ]]; then
-        diff <(printf '%s\n' "$SNAP_AFTER") <(dc_snapshot "$VERIFY") >&2 || true
-        die "the pushed history does not match the local rewrite"
-    fi
-    if [[ $(printf '%s\n' "$SNAP_BEFORE" | awk '{print $1, $2, $3}') != \
-          $(dc_snapshot "$VERIFY" | awk '{print $1, $2, $3}') ]]; then
-        die "file content changed during the rewrite"
-    fi
-    (( $(dc_residual_attribution_count "$VERIFY") == 0 )) || die "attribution still present on GitHub"
-    (( $(dc_residual_identity_count "$VERIFY") == 0 ))    || die "Claude identities still present on GitHub"
-    ok "verified on GitHub: content identical, no Claude attribution on any branch"
-
-    # The homepage sidebar keeps its own contributor cache that a force-push
-    # does not touch. Toggling the default branch is what flushes it; see the
-    # measurements in lib/github.sh.
-    step "Flushing the homepage sidebar cache"
-    if gh_flush_sidebar_cache "$REPO" "$DEFAULT_BRANCH"; then
-        ok "default branch toggled and restored"
-    else
-        warn "could not toggle the default branch, which needs admin rights."
-        warn "Insights will clear, but the repo homepage sidebar may keep listing"
-        warn "Claude. To fix by hand: Settings > change the default branch to any"
-        warn "other branch, save, then change it back."
-    fi
-
-    step "Waiting for GitHub to recompute"
-    say "    ${C_BOLD}Do not push or change settings until this finishes.${C_RESET}"
-    say "    ${C_DIM}Insights takes a few minutes; the sidebar about a minute after the toggle.${C_RESET}"
-
-    graph_t0=$(date +%s)
-    graph_done=0 sidebar_done=0
-    for _ in $(seq 1 "${DECLAUDIFY_GRAPH_TRIES:-90}"); do
-        elapsed=$(( $(date +%s) - graph_t0 ))
-
-        if (( ! graph_done )); then
-            graph=$(gh api "repos/$REPO/stats/contributors" \
-                    --jq '[.[] | "\(.author.login)"] | join(" ")' 2>/dev/null || true)
-            if [[ -n $graph ]] && ! dc_list_has_claude "$graph"; then
-                ok "Insights contributors clean after ${elapsed}s ($graph)"
-                graph_done=1
-            else
-                detail "${elapsed}s insights: ${graph:-recomputing}"
-            fi
-        fi
-
-        if (( ! sidebar_done )); then
-            sidebar=$(gh_sidebar_contributors "$REPO" | tr '\n' ' ' || true)
-            if [[ -n $sidebar ]] && ! dc_list_has_claude "$sidebar"; then
-                ok "homepage sidebar clean after ${elapsed}s ($sidebar)"
-                sidebar_done=1
-            else
-                detail "${elapsed}s sidebar:  ${sidebar:-unreadable}"
-            fi
-        fi
-
-        (( graph_done && sidebar_done )) && break
-        sleep 10
-    done
-
-    if (( ! graph_done || ! sidebar_done )); then
-        say ''
-        (( graph_done ))   || warn "Insights had not settled yet when this stopped watching."
-        (( sidebar_done )) || warn "The homepage sidebar had not settled yet when this stopped watching."
-        warn "Both usually finish within about ten minutes. Re-check with:"
-        say "        gh api repos/$REPO/stats/contributors --jq '[.[].author.login]'"
-        say "        open https://github.com/$REPO"
-    fi
-
-    step "Done"
-    say "    $REPO rewritten in place. Nothing was deleted."
-    say "    Backup: $WORKDIR/backup.bundle"
-    say "    Re-clone local copies: git clone $PUSH_URL"
-    exit 0
-fi
-
-# =============================================================================
-# Confirmation
+# Confirm
 # =============================================================================
 
-# Let the user pick what happens to the old repo, rather than making deletion an
-# invisible default they only notice afterwards.
-GH_LOSS_LIST='' GH_LOSS_STARS=0
-gh_inventory "$REPO" || warn "could not read the repo's inventory"
-
-step "This replaces $REPO"
-say "    1. rename  $REPO -> $OWNER/$OLD_NAME"
-say "    2. create  $REPO (fresh, $VISIBILITY)"
-say "    3. push    $REPO_SIZE"
-if (( KEEP_OLD_SET )); then
-    if (( KEEP_OLD )); then
-        say "    4. verify, then keep $OWNER/$OLD_NAME"
-    else
-        say "    4. verify, then ${C_RED}${C_BOLD}delete $OWNER/$OLD_NAME permanently${C_RESET}"
-    fi
-else
-    say "    4. verify, then delete or keep the old repo (asked next)"
-fi
-
-# Stars are the loss people regret and the only one that cannot be recreated by
-# hand afterwards, so they get their own line instead of sitting in a list.
+step "This rewrites $REPO in place"
+say "    force-push  $REPO_SIZE to $OWNER/$NAME"
+(( CAN_FLUSH )) && say "    then flip the default branch away and back to refresh the sidebar"
+say "    nothing is renamed, replaced or deleted; stars and issues stay put"
 say ''
-if (( GH_LOSS_STARS > 0 )); then
-    say "    ${C_RED}${C_BOLD}This deletes $(plural "$GH_LOSS_STARS" star).${C_RESET} Stars cannot be transferred or"
-    say "    restored. The replacement repo starts back at zero."
-fi
-if [[ -n $GH_LOSS_LIST ]]; then
-    say "    ${C_YELLOW}Lost with the old repo:${C_RESET} $GH_LOSS_LIST"
-fi
-say "    ${C_DIM}Also webhooks, deploy keys, branch protection, Actions secrets,${C_RESET}"
-say "    ${C_DIM}collaborators, Pages config. Kept: code, history, description, topics.${C_RESET}"
-
-# Forks are the one case where deleting the repo does NOT purge the old commits:
-# GitHub promotes a fork to root the network and the objects survive there.
-FORKS=$(gh_repo_field "$REPO" '.forks_count')
-if [[ ${FORKS:-0} != 0 ]]; then
-    say ''
-    warn "$REPO has $FORKS fork(s), so deleting it will NOT remove the old commits."
-    warn "GitHub promotes a fork to root the network and the objects live on there."
-fi
+say "    ${C_YELLOW}Commit SHAs change,${C_RESET} so existing clones will need re-cloning."
+say "    ${C_DIM}Old commits stay reachable by SHA and in pull-request refs, but${C_RESET}"
+say "    ${C_DIM}neither feeds a contributor list.${C_RESET}"
 
 if [[ $DECLAUDIFY_DRY_RUN == 1 ]]; then
     step "Dry run: nothing on GitHub was touched"
@@ -576,116 +351,103 @@ if [[ $DECLAUDIFY_DRY_RUN == 1 ]]; then
     exit 0
 fi
 
-confirm "Replace $REPO?" "$NAME"
-
-# Asked after the plan is on screen, so the choice is made with the cost visible.
-if (( ! KEEP_OLD_SET )) && (( CAN_DELETE )); then
-    choose old_repo_plan "Once verified, what happens to the old repo?" \
-        "delete:remove it from GitHub for good" \
-        "keep:keep it so you can check things first"
-    if [[ $old_repo_plan == keep ]]; then KEEP_OLD=1; fi
-fi
+confirm "Rewrite $REPO?" "$NAME"
 
 # =============================================================================
-# 2. Rename the old repo
+# Push and verify
 # =============================================================================
 
-step "Migrating"
-gh_rename "$REPO" "$OLD_NAME"
-rollback_push "gh api -X PATCH repositories/$REPO_ID -f name='$NAME'"
-
-ACTUAL_OLD=$(gh_name_by_id "$REPO_ID")
-[[ -n $ACTUAL_OLD ]] || die "lost track of repo id $REPO_ID after rename"
-if [[ $ACTUAL_OLD != "$OWNER/$OLD_NAME" ]]; then
-    warn "GitHub normalised the name to $ACTUAL_OLD (requested $OWNER/$OLD_NAME)"
-fi
-ok "renamed old repo to $ACTUAL_OLD"
-
-# =============================================================================
-# 3. Create the replacement
-# =============================================================================
-
-gh_create "$REPO" "$VISIBILITY" "$DESCRIPTION" "$HOMEPAGE"
-rollback_push "gh repo delete '$REPO' --yes"
-
-for attempt in 1 2 3 4 5; do
-    gh_repo_exists "$REPO" && break
-    sleep 2
-done
-gh_repo_exists "$REPO" || die "created $REPO but it did not become visible"
-NEW_ID=$(gh_repo_field "$REPO" '.id')
-ok "created fresh $REPO"
-
-# =============================================================================
-# 4. Push the rewritten history
-# =============================================================================
-
+step "Rewriting"
 PUSH_URL="https://github.com/$REPO.git"
-git -C "$MIRROR" push --mirror --quiet "$PUSH_URL" ||
-    die "push failed - the old repo is still intact at $ACTUAL_OLD"
-ok "pushed $REPO_SIZE"
-
-gh_set_default_branch "$REPO" "$DEFAULT_BRANCH"
-gh_copy_topics "$ACTUAL_OLD" "$REPO"
-detail "default branch and topics restored"
-
-# =============================================================================
-# 5. Verify the new repo really has everything
-# =============================================================================
+git -C "$MIRROR" push --force --quiet "$PUSH_URL" 'refs/heads/*:refs/heads/*' ||
+    die "push failed; $REPO is unchanged"
+git -C "$MIRROR" push --force --quiet "$PUSH_URL" 'refs/tags/*:refs/tags/*' 2>/dev/null || true
+ok "force-pushed $REPO_SIZE"
 
 VERIFY="$WORKDIR/verify.git"
 rm -rf "$VERIFY"
 git clone --quiet --mirror "$PUSH_URL" "$VERIFY"
 dc_prune_foreign_refs "$VERIFY" >/dev/null
 
-SNAP_REMOTE=$(dc_snapshot "$VERIFY")
-if [[ $SNAP_REMOTE != "$SNAP_AFTER" ]]; then
-    say ''
-    diff <(printf '%s\n' "$SNAP_AFTER") <(printf '%s\n' "$SNAP_REMOTE") >&2 || true
-    die "the pushed repo does not match the rewritten history - NOT deleting anything"
+if [[ $(dc_snapshot "$VERIFY") != "$SNAP_AFTER" ]]; then
+    diff <(printf '%s\n' "$SNAP_AFTER") <(dc_snapshot "$VERIFY") >&2 || true
+    die "the pushed history does not match the local rewrite"
 fi
-detail "all refs, trees and commit counts match the rewritten history"
-
 if [[ $(printf '%s\n' "$SNAP_BEFORE" | awk '{print $1, $2, $3}') != \
-      $(printf '%s\n' "$SNAP_REMOTE" | awk '{print $1, $2, $3}') ]]; then
-    die "the pushed repo's content differs from the original - NOT deleting anything"
+      $(dc_snapshot "$VERIFY" | awk '{print $1, $2, $3}') ]]; then
+    die "file content changed during the rewrite"
 fi
-detail "content on GitHub is identical to the original repo"
-
-verify_commits=$(git -C "$VERIFY" rev-list --all --count)
-[[ $verify_commits == "$COMMITS" ]] ||
-    die "commit count mismatch: expected $COMMITS, found $verify_commits"
-detail "$verify_commits commits present"
-
-# Re-run the strict gates against what is actually on GitHub, not against what
-# we believe we pushed. This is the last check before anything is deleted.
-remote_attr=$(dc_residual_attribution_count "$VERIFY")
-remote_ident=$(dc_residual_identity_count "$VERIFY")
-(( remote_attr == 0 ))  || die "$remote_attr attribution line(s) present on GitHub - NOT deleting anything"
-(( remote_ident == 0 )) || die "$remote_ident Claude-attributed commit(s) on GitHub - NOT deleting anything"
-ok "verified on GitHub: content identical, no Claude attribution"
+(( $(dc_residual_attribution_count "$VERIFY") == 0 )) || die "attribution still present on GitHub"
+(( $(dc_residual_identity_count "$VERIFY") == 0 ))    || die "Claude identities still present on GitHub"
+ok "verified on GitHub: content identical, no Claude attribution on any branch"
 
 # =============================================================================
-# 6. Delete the old repo
+# Refresh the contributor listings
 # =============================================================================
 
-if (( KEEP_OLD )); then
+if (( CAN_FLUSH )); then
+    step "Flushing the homepage sidebar cache"
+    if gh_flush_sidebar_cache "$REPO" "$DEFAULT_BRANCH"; then
+        ok "default branch toggled and restored"
+    else
+        CAN_FLUSH=0
+        warn "could not toggle the default branch."
+        warn "To do it by hand: Settings > General > Default branch, switch it to"
+        warn "any other branch, save, then switch it back to $DEFAULT_BRANCH."
+    fi
+fi
+
+step "Waiting for GitHub to recompute"
+say "    ${C_BOLD}Do not push or change settings until this finishes.${C_RESET}"
+say "    ${C_DIM}Insights takes a few minutes; the sidebar about a minute after the toggle.${C_RESET}"
+
+t0=$(date +%s)
+graph_done=0 sidebar_done=0
+for _ in $(seq 1 "${DECLAUDIFY_GRAPH_TRIES:-90}"); do
+    elapsed=$(( $(date +%s) - t0 ))
+
+    if (( ! graph_done )); then
+        graph=$(gh api "repos/$REPO/stats/contributors" \
+                --jq '[.[].author.login] | join(" ")' 2>/dev/null || true)
+        if [[ -n $graph ]] && ! dc_list_has_claude "$graph"; then
+            ok "Insights contributors clean after ${elapsed}s ($graph)"
+            graph_done=1
+        else
+            detail "${elapsed}s insights: ${graph:-recomputing}"
+        fi
+    fi
+
+    if (( ! sidebar_done )); then
+        sidebar=$(gh_sidebar_contributors "$REPO" | tr '\n' ' ' || true)
+        if [[ -n $sidebar ]] && ! dc_list_has_claude "$sidebar"; then
+            ok "homepage sidebar clean after ${elapsed}s ($sidebar)"
+            sidebar_done=1
+        else
+            detail "${elapsed}s sidebar:  ${sidebar:-unreadable}"
+        fi
+    fi
+
+    (( graph_done && sidebar_done )) && break
+    sleep 10
+done
+
+if (( ! graph_done || ! sidebar_done )); then
     say ''
-    warn "Old repo kept: https://github.com/$ACTUAL_OLD"
-    warn "The Claude commits stay on GitHub until you remove it:"
-    say "        ${C_BOLD}gh repo delete $ACTUAL_OLD${C_RESET}"
-    rollback_clear
-else
-    say ''
-    say "    ${C_RED}${C_BOLD}Deleting https://github.com/$ACTUAL_OLD cannot be undone.${C_RESET}"
-    say "    Your backup stays at $WORKDIR/backup.bundle"
-    confirm "Delete $ACTUAL_OLD permanently?" "delete"
-    gh_delete "$ACTUAL_OLD"
-    ok "deleted $ACTUAL_OLD"
-    rollback_clear
+    (( graph_done )) || warn "Insights had not settled yet when this stopped watching."
+    if (( ! sidebar_done )); then
+        if (( CAN_FLUSH )); then
+            warn "The homepage sidebar had not settled yet when this stopped watching."
+        else
+            warn "The homepage sidebar was not flushed, so it will keep listing Claude."
+            warn "Toggle the default branch in Settings and back to clear it."
+        fi
+    fi
+    warn "Re-check with:"
+    say "        gh api repos/$REPO/stats/contributors --jq '[.[].author.login]'"
+    say "        open https://github.com/$REPO"
 fi
 
 step "Done"
-say "    https://github.com/$REPO has $COMMITS commits, no Claude attribution."
+say "    https://github.com/$REPO has $COMMITS commits with no Claude attribution."
 say "    Backup: $WORKDIR/backup.bundle"
-say "    Re-clone local copies: git clone https://github.com/$REPO.git"
+say "    Re-clone local copies: git clone $PUSH_URL"

@@ -29,98 +29,63 @@ This is not a coincidence. It is structural. The logos look like buttholes
 because the companies are full of shit, and good branding should reflect the
 product.
 
-Anyway. That thing ends up sitting in your commit history forever, and this
-removes it.
+Anyway. That thing ends up in your contributors list, and this removes it.
 
 ## The part where I explain why this is harder than you think
 
-You already tried the obvious fix. You rewrote the trailer out of your commits,
+You already tried the obvious fix. You stripped the `Co-authored-by` trailers,
 you force-pushed, you felt good about yourself.
 
-**It is still there.**
+Go look at your repo homepage. **Claude is still in the Contributors sidebar.**
 
-GitHub keeps a separate `refs/pull/N/head` ref for every pull request you have
-ever opened. A branch push cannot touch those refs. Your original commits, orange
-logo and all, are still sitting in the PR's Commits tab and are still reachable
-by SHA. Forever. Long after you have forgotten they exist.
-
-Do not take my word for it. Go look at your own repo:
-
-```sh
-git clone --mirror https://github.com/YOU/YOUR-REPO.git check.git
-git -C check.git for-each-ref | grep refs/pull
-```
-
-There it is. Hi.
-
-The only way to actually remove those objects is to replace the repository
-itself. So that is what this does.
-
-## How it works
-
-```
-0. mirror-clone the repo             4. push the rewritten history into it
-1. rewrite the history               5. verify the new repo matches
-2. rename the old repo to "<name>."  6. delete the old repo (if you say so)
-3. create a fresh repo as "<name>"
-```
-
-Nothing gets deleted until step 5 has proved the replacement is complete and its
-file content is byte for byte identical to the original. The tool is paranoid on
-your behalf, because the alternative is a very bad afternoon.
-
-## Two modes, and how to pick
-
-**Most people want `--in-place`.** It rewrites history and force-pushes the same
-repo. Nothing is renamed, nothing is deleted, you keep every star.
-
-```sh
-declaudify --in-place owner/repo
-```
-
-There are **two separate contributor caches**, and they do not clear the same way:
+GitHub renders contributors from **two separate caches**, and a force-push only
+clears one of them:
 
 | Surface | Cleared by | How long |
 |---|---|---|
 | Insights > Contributors | the force-push | a few minutes |
-| Repo homepage sidebar | a **default-branch toggle** | 60 to 80 seconds |
+| **Repo homepage sidebar** | **toggling the default branch** | **60 to 80 seconds** |
 
-`--in-place` does both: it force-pushes, then flips the default branch to a
-temporary branch and straight back, which is what flushes the homepage sidebar.
-Then it waits until *both* surfaces actually come back clean before saying done.
-
-Pull-request refs never feed either surface, so replacing the repo is not
-required and no stars are lost.
-
-Measured with no-op control windows, on a clone of a real 200-commit repo:
+I measured this properly, with no-op control windows, on a clone of a real
+200-commit repo:
 
 ```
-force-push only, nothing else   ->  sidebar still stale after 919s
+force-push only, nothing else   ->  sidebar STILL STALE after 919s
 archive + unarchive             ->  no effect
 extra commit on default branch  ->  no effect
-default-branch toggle           ->  sidebar cleared in 61s / 81s / 62s
+default-branch toggle           ->  cleared in 61s / 81s / 62s
 ```
 
-The widely repeated advice to "wait 24 to 48 hours" is wrong on both counts: the
-sidebar does not clear on its own in any reasonable time, and once you toggle the
+So the internet's advice to "just wait 24 to 48 hours" is wrong twice over. The
+sidebar does not fix itself in any useful timeframe, and once you toggle the
 default branch it clears in about a minute.
 
-Note the sidebar is genuinely invisible to the REST API. `/repos/{o}/{r}/contributors`
-omits co-authors entirely, so a repo can look clean there while the homepage still
-shows Claude. declaudify reads the same private `/_sidebar` endpoint the page uses.
+It gets better: the sidebar is **invisible to the REST API**.
+`/repos/{owner}/{repo}/contributors` omits co-authors entirely, so your repo can
+look perfectly clean through the API while the homepage still credits Claude to
+every visitor. declaudify reads the same private `/_sidebar` endpoint the page
+itself uses, so it can actually tell.
 
-**Use the default mode** when you need the old commits genuinely gone, not just
-absent from the graph. A force-push cannot reach `refs/pull/N/head`, so old
-commits stay fetchable by SHA forever. Only replacing the repository removes
-them, and that is what costs you the stars.
+## What it does
 
-| | `--in-place` | default (replace) |
-|---|---|---|
-| Stars, forks, issues, PRs | kept | **lost** |
-| Off the contributors graph | yes, minutes | yes, immediately |
-| Old commits gone from PR refs | no | yes |
-| Needs `delete_repo` scope | no | yes |
-| Needs admin | only to flush the sidebar | yes |
+```
+1. mirror-clone your repo, and bundle a full backup first
+2. rewrite every commit message, author, committer, tag message and tagger
+3. force-push it back to the SAME repo
+4. verify on GitHub that content is byte-identical and attribution is gone
+5. toggle the default branch away and back, flushing the sidebar cache
+6. wait until BOTH contributor lists actually come back clean
+```
+
+Your repository is never renamed, replaced or deleted. **Stars, issues, pull
+requests, forks, releases, webhooks and settings are all untouched.** The only
+cost is that commit SHAs change, so existing clones need re-cloning.
+
+Old commits do stay reachable by SHA and inside `refs/pull/N/head`, which no
+force-push can reach. Neither feeds a contributor list, so Claude will not appear
+anywhere GitHub renders contributors, but the objects are still on the server.
+If you need them genuinely gone, nothing short of deleting the repository does
+that, and that is your call to make, not this tool's.
 
 ## Install
 
@@ -164,29 +129,26 @@ Then for real:
 declaudify ParkerrDev/my-repo
 ```
 
-It shows a diff of every line it is about to delete, the plan, and exactly what
-you are about to lose. Then it makes you type the repo name:
+It shows a diff of every line it is about to remove, then makes you type the
+repo name:
 
 ```
-Replace ParkerrDev/my-repo?
+Rewrite ParkerrDev/my-repo?
 Type my-repo to continue (anything else aborts):
 ```
 
-Then it asks about the old repo:
+After the push it flushes the sidebar cache and waits, reporting each surface as
+it comes back clean:
 
 ```
-Once verified, what happens to the old repo?
-    delete  remove it from GitHub for good
-    keep    keep it so you can check things first
-Choose [delete/keep]:
+==> Waiting for GitHub to recompute
+    Do not push or change settings until this finishes.
+    ✓ Insights contributors clean after 0s (ParkerrDev)
+    ✓ homepage sidebar clean after 62s (ParkerrDev)
 ```
 
-If you chose `delete`, it makes you type `delete` as well, after verification has
-passed. Two different words on purpose, so a reflexive `y` cannot vaporize
-anything.
-
-`--dry-run` walks the whole thing including the plan and the loss summary, and
-stops right before the first prompt. Nothing on GitHub is touched.
+`--dry-run` walks the whole thing and stops right before the prompt. Nothing on
+GitHub is touched.
 
 ### Options
 
@@ -195,10 +157,7 @@ stops right before the first prompt. Nothing on GitHub is touched.
 | `-n, --dry-run` | Rewrite locally, change nothing on GitHub |
 | `-y, --yes` | Skip every prompt. You had better be sure |
 | `-v, --verbose` | Show every step instead of just the important ones |
-| `--in-place` | Rewrite the same repo instead of replacing it. Keeps your stars |
-| `--keep-old` | Keep the renamed old repo |
-| `--delete-old` | Delete it without being asked which you want |
-| `--suffix <s>` | Suffix for the renamed old repo (default `.`) |
+| `--no-flush` | Skip the default-branch toggle (leaves the sidebar stale) |
 | `--name` / `--email` | Who to reattribute the AI's commits to |
 | `--workdir <dir>` | Where to work. Default keeps the backup in `~/.cache/declaudify` |
 | `--drop-regex <re>` | Override which message lines get deleted |
@@ -208,17 +167,13 @@ stops right before the first prompt. Nothing on GitHub is touched.
 
 ## About your token
 
-declaudify needs the `repo` scope to rename and create repositories, and
-`delete_repo` to remove the old one. If either is missing it tells you up front,
-prints the exact command to fix it, and refuses to start a migration it cannot
-finish:
+declaudify needs an authenticated `gh` with **push access**. That is it. There is
+no `delete_repo` scope to grant, because nothing is ever deleted.
 
-```sh
-gh auth refresh -h github.com -s repo -s delete_repo
-```
-
-If you are only missing `delete_repo`, it offers to migrate anyway and keep the
-old repo so you can delete it yourself later. It does not strand you halfway.
+**Admin** rights are needed only for the default-branch toggle that flushes the
+sidebar. Without them the rewrite still runs and Insights still clears; you will
+be told to flip the default branch yourself in Settings, or you can pass
+`--no-flush` to skip it deliberately.
 
 ## What it rewrites
 
@@ -252,60 +207,47 @@ Claude Dubois has done nothing wrong and deserves to keep his commits.
 
 ## Safety
 
-This is a tool whose last step is `gh repo delete`, so:
-
-- **Dry run mode** does the entire local half and nothing else.
-- **A backup bundle** of the original history is written before anything is
-  rewritten, and kept afterwards. Restore with `git clone backup.bundle restored`.
+- **Dry run mode** does the entire local half and touches nothing on GitHub.
+- **A backup bundle** of the original history, pull-request refs included, is
+  written before anything is rewritten and kept afterwards. If a run fails,
+  declaudify prints the exact commands to push it back.
 - **Content gate.** Every branch and tag must have the same tree hash and commit
-  count after the rewrite as before. A history rewrite is supposed to change
-  metadata and nothing else, so if a single byte of your actual files moves,
-  declaudify stops.
-- **Attribution gates.** Zero surviving attribution lines, zero surviving Claude
-  identities, checked on the local rewrite and then checked *again* against what
-  is really on GitHub after the push.
-- **Rollback.** If anything fails after the rename, the old repo gets renamed
-  back and a half-created replacement gets removed.
-- Deletion happens only after all of the above passes, and only if you asked for
-  it, and only after you type the word.
+  count after the rewrite as before. A history rewrite changes metadata and
+  nothing else, so if a single byte of your files moves, it stops before pushing.
+- **Attribution gates.** Zero surviving attribution lines and zero surviving
+  Claude identities, checked on the local rewrite and then checked *again*
+  against what is really on GitHub after the push.
+- **Verified, not assumed.** It re-clones the pushed repo and compares it to the
+  local rewrite rather than trusting that the push did what it said.
 
-## What you lose
+## What it costs
 
-**Your stars.** All of them. They cannot be transferred or restored, and the
-replacement repo starts at zero. This is the one that stings, so declaudify
-counts them and says so in red before you confirm:
+**Commit SHAs change.** That is the entire cost. Anyone with a clone, including
+you, needs to re-clone:
 
-```
-This deletes 4 stars. Stars cannot be transferred or
-restored. The replacement repo starts back at zero.
-Lost with the old repo: 1 watcher, the wiki
+```sh
+git clone https://github.com/OWNER/REPO.git
 ```
 
-Also gone: issues, pull requests, releases, forks, watchers, wiki, webhooks,
-deploy keys, branch protection, Actions secrets and variables, environments,
-collaborators, Pages configuration.
-
-Carried over: code, full history, description, homepage, topics, visibility and
-default branch.
-
-declaudify counts what your repo actually has and shows you before asking to
-confirm, so you know what you are trading for a cleaner git log. If that trade
-is bad for a given repo, run `--dry-run`, look at the numbers, and walk away.
-Completely reasonable outcome.
+Nothing is renamed, replaced or deleted. Your stars, issues, pull requests,
+forks, releases, watchers, wiki, webhooks, branch protection, Actions secrets and
+Pages config all stay exactly as they were.
 
 ## Limitations
 
-- **Forks.** If your repo has forks, deleting it does not purge anything.
-  GitHub promotes a fork to root the network and the old commits live on there.
-  declaudify warns you when this applies.
-- **Existing clones** still have the old history and need re-cloning.
-- **Signatures.** Rewriting invalidates GPG and SSH signatures, so they get
-  dropped rather than left dangling and broken.
-- **Open PRs** die with the old repo. Merge or close them first.
+- **Existing clones** keep the old history and need re-cloning.
+- **Signatures.** Rewriting invalidates GPG and SSH commit signatures, so they
+  are dropped rather than left dangling and broken.
+- **Old objects survive on the server.** `refs/pull/N/head` is read-only, so
+  those commits stay fetchable by SHA. They do not appear in either contributor
+  list, but if you need them actually gone, only deleting the repository does
+  that.
+- **The sidebar flush needs admin.** Without it, Insights clears and the homepage
+  sidebar does not.
 - `git filter-branch` spawns a process per commit, so enormous histories are
-  slow. It is used on purpose instead of `git filter-repo`, because it ships with
-  git, and a tool whose worst case is "half-migrated repo" should not depend on
-  something you might not have installed.
+  slow. It is used on purpose instead of `git filter-repo` because it ships with
+  git, and a tool that force-pushes your history should not depend on something
+  you might not have installed.
 
 ## Tests
 
