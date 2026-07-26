@@ -39,9 +39,12 @@ gh_repo_field() { gh api "repos/$1" --jq "$2" 2>/dev/null; }
 # Authoritative current full_name for a repo id - survives any rename.
 gh_name_by_id() { gh api "repositories/$1" --jq '.full_name' 2>/dev/null; }
 
-# Tab-separated inventory of everything a rename/recreate migration does NOT
-# carry over, so the confirmation prompt can be honest about the cost.
-# Fields: issues+PRs, releases, stars, forks, watchers, wiki, pages
+# Everything a rename/recreate migration cannot carry over, phrased for a human
+# and listing only what this repo actually has. Sets:
+#   GH_LOSS_LIST    e.g. "4 stars, 1 watcher, the wiki"  (empty if nothing)
+#   GH_LOSS_STARS   star count, so the caller can shout about it separately
+# Stars come first because they are the loss people regret and the only one
+# that cannot be recreated by hand afterwards.
 gh_inventory() {
     local repo=$1 base releases
     base=$(gh api "repos/$repo" --jq \
@@ -52,8 +55,32 @@ gh_inventory() {
     local issues stars forks watchers wiki pages
     IFS=$'\t' read -r issues stars forks watchers wiki pages <<<"$base"
 
-    printf 'open issues+PRs=%s  releases=%s  stars=%s  forks=%s  watchers=%s  wiki=%s  pages=%s\n' \
-        "$issues" "$releases" "$stars" "$forks" "$watchers" "$wiki" "$pages"
+    GH_LOSS_STARS=${stars:-0}
+
+    # Stars are deliberately NOT in this list: they get their own, louder line,
+    # and GH_LOSS_STARS carries the count for it.
+    local -a parts=()
+    _count_part parts "${forks:-0}"    "fork"
+    _count_part parts "${watchers:-0}" "watcher"
+    _count_part parts "${issues:-0}"   "open issue or PR" "open issues and PRs"
+    _count_part parts "${releases:-0}" "release"
+    if [[ $wiki  == true ]]; then parts+=("the wiki"); fi
+    if [[ $pages == true ]]; then parts+=("the Pages site"); fi
+
+    GH_LOSS_LIST=''
+    local p
+    for p in ${parts[@]+"${parts[@]}"}; do
+        GH_LOSS_LIST="${GH_LOSS_LIST:+$GH_LOSS_LIST, }$p"
+    done
+    return 0
+}
+
+# Append "<n> <thing>" (pluralised) to the named array, unless n is zero.
+_count_part() {
+    local -n __arr=$1
+    local n=$2 singular=$3 plural=${4:-${3}s}
+    (( n > 0 )) || return 0
+    if (( n == 1 )); then __arr+=("$n $singular"); else __arr+=("$n $plural"); fi
 }
 
 gh_rename() {

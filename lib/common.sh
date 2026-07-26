@@ -23,6 +23,14 @@ info() { printf '    %s·%s %s\n' "$C_DIM" "$C_RESET" "$*" >&2; }
 warn() { printf '    %s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
 bad()  { printf '    %s✗%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
 
+# Progress chatter that only appears with --verbose. Anything the user has to
+# read, decide on, or act upon is never routed through here.
+: "${DECLAUDIFY_VERBOSE:=0}"
+detail() {
+    [[ $DECLAUDIFY_VERBOSE == 1 ]] || return 0
+    printf '    %s·%s %s\n' "$C_DIM" "$C_RESET" "$*" >&2
+}
+
 die() {
     printf '\n%serror:%s %s\n' "$C_RED$C_BOLD" "$C_RESET" "$*" >&2
     exit 1
@@ -174,3 +182,9 @@ need_cmd() {
 
 # Portable lowercase (avoids bash 4 ${var,,} so the filters stay POSIX-friendly).
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# "1 commit" / "3 commits". Third argument overrides an irregular plural.
+plural() {
+    local n=$1 singular=$2 many=${3:-${2}s}
+    if (( n == 1 )); then printf '%s %s' "$n" "$singular"; else printf '%s %s' "$n" "$many"; fi
+}

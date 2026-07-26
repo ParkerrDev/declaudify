@@ -111,19 +111,29 @@ Then for real:
 declaudify ParkerrDev/my-repo
 ```
 
-It will show you a diff of every line it is about to delete, an inventory of what
-the migration cannot carry over, and ask what should happen to the old repo:
+It shows a diff of every line it is about to delete, the plan, and exactly what
+you are about to lose. Then it makes you type the repo name:
 
 ```
-Once the new repo is verified, what should happen to the old one?
-    delete  delete ParkerrDev/my-repo. permanently, so the old commits are gone from GitHub
-    keep    keep it as ParkerrDev/my-repo. so you can check it first and delete it yourself
+Replace ParkerrDev/my-repo?
+Type my-repo to continue (anything else aborts):
+```
+
+Then it asks about the old repo:
+
+```
+Once verified, what happens to the old repo?
+    delete  remove it from GitHub for good
+    keep    keep it so you can check things first
 Choose [delete/keep]:
 ```
 
-Then it makes you type the repo name to confirm, and if you chose `delete` it
-makes you type `delete` as well, after verification passes. Two different words,
-on purpose, so a reflexive `y` cannot vaporize anything.
+If you chose `delete`, it makes you type `delete` as well, after verification has
+passed. Two different words on purpose, so a reflexive `y` cannot vaporize
+anything.
+
+`--dry-run` walks the whole thing including the plan and the loss summary, and
+stops right before the first prompt. Nothing on GitHub is touched.
 
 ### Options
 
@@ -131,6 +141,7 @@ on purpose, so a reflexive `y` cannot vaporize anything.
 |---|---|
 | `-n, --dry-run` | Rewrite locally, change nothing on GitHub |
 | `-y, --yes` | Skip every prompt. You had better be sure |
+| `-v, --verbose` | Show every step instead of just the important ones |
 | `--keep-old` | Keep the renamed old repo |
 | `--delete-old` | Delete it without being asked which you want |
 | `--suffix <s>` | Suffix for the renamed old repo (default `.`) |
@@ -206,19 +217,27 @@ This is a tool whose last step is `gh repo delete`, so:
 
 ## What you lose
 
-Replacing a repository cannot carry over:
+**Your stars.** All of them. They cannot be transferred or restored, and the
+replacement repo starts at zero. This is the one that stings, so declaudify
+counts them and says so in red before you confirm:
 
-> issues, pull requests, releases, stars, forks, watchers, wiki, webhooks, deploy
-> keys, branch protection, Actions secrets and variables, environments,
-> collaborators, Pages configuration
+```
+This deletes 4 stars. Stars cannot be transferred or
+restored. The replacement repo starts back at zero.
+Lost with the old repo: 1 watcher, the wiki
+```
 
-It does carry over description, homepage, topics, visibility, default branch, and
-obviously every branch, tag and commit.
+Also gone: issues, pull requests, releases, forks, watchers, wiki, webhooks,
+deploy keys, branch protection, Actions secrets and variables, environments,
+collaborators, Pages configuration.
 
-declaudify prints a live inventory of your repo before asking you to confirm, so
-you know exactly what you are trading for a cleaner git log. If that trade is a
-bad one for a given repo, use `--dry-run`, look at the numbers, and walk away.
-That is a completely reasonable outcome.
+Carried over: code, full history, description, homepage, topics, visibility and
+default branch.
+
+declaudify counts what your repo actually has and shows you before asking to
+confirm, so you know what you are trading for a cleaner git log. If that trade
+is bad for a given repo, run `--dry-run`, look at the numbers, and walk away.
+Completely reasonable outcome.
 
 ## Limitations
 
@@ -240,7 +259,7 @@ That is a completely reasonable outcome.
 ./tests/run-tests.sh
 ```
 
-68 assertions, no network, no dependencies past git and awk. They build throwaway
+73 assertions, no network, no dependencies past git and awk. They build throwaway
 repos containing every flavour of attribution, plus the false-positive bait
 mentioned above and a commit reachable only from `refs/pull/1/head`, run the real
 rewrite passes, and assert that trees are unchanged, every ref is covered, and

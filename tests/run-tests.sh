@@ -321,6 +321,41 @@ DECLAUDIFY_ASSUME_YES=0
 ( set +e; DECLAUDIFY_ASSUME_YES=0; confirm "needs a tty?" </dev/null >/dev/null 2>&1 )
 is "confirm refuses rather than assuming yes when it cannot ask" "$?" "1"
 
+suite "what-you-lose summary"
+
+# Stub gh so the inventory can be tested without touching the network.
+# jq field order is: issues, stars, forks, watchers, wiki, pages
+source "$ROOT/lib/github.sh"
+_stub_gh() {
+    local fields=$1 releases=$2
+    eval "gh() {
+        case \"\$*\" in
+            *releases*) printf '%s\n' '$releases' ;;
+            *)          printf '%s\n' '$fields' ;;
+        esac
+    }"
+}
+
+_stub_gh "$(printf '2\t4\t1\t5\ttrue\tfalse')" 3
+GH_LOSS_LIST='' GH_LOSS_STARS=0
+gh_inventory "who/what"
+is "counts stars separately so they can be shouted about" "$GH_LOSS_STARS" "4"
+is "lists losses in plain English, stars excluded" "$GH_LOSS_LIST" \
+   "1 fork, 5 watchers, 2 open issues and PRs, 3 releases, the wiki"
+
+_stub_gh "$(printf '0\t1\t0\t1\tfalse\tfalse')" 0
+GH_LOSS_LIST='' GH_LOSS_STARS=0
+gh_inventory "who/what"
+is "singular forms read correctly" "$GH_LOSS_LIST" "1 watcher"
+
+_stub_gh "$(printf '0\t0\t0\t0\tfalse\tfalse')" 0
+GH_LOSS_LIST='x' GH_LOSS_STARS=9
+gh_inventory "who/what"
+is "an empty repo loses nothing" "$GH_LOSS_LIST" ""
+is "…and reports zero stars" "$GH_LOSS_STARS" "0"
+
+unset -f gh
+
 suite "installer"
 
 sh -n "$ROOT/install.sh" && r=ok || r=failed

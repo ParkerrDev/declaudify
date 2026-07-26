@@ -42,18 +42,12 @@ die()  { printf '\n%serror:%s %s\n' "$RED$BOLD" "$RESET" "$*" >&2; exit 1; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-say ""
-say "${BOLD}declaudify installer${RESET}"
-say ""
 
 # --- dependencies ------------------------------------------------------------
 
 have git || die "git is required but was not found. Install git and try again."
-ok "git $(git --version | awk '{print $3}')"
 
-if have gh; then
-    ok "gh $(gh --version 2>/dev/null | head -1 | awk '{print $3}')"
-else
+if ! have gh; then
     warn "gh (the GitHub CLI) was not found."
     warn "declaudify needs it to rename, create and delete repositories."
     warn "Install it from https://cli.github.com then run: gh auth login"
@@ -134,8 +128,6 @@ if have gh; then
                 say ""
                 warn "Without delete_repo you can still migrate, but you will have to"
                 warn "delete the old repo yourself (declaudify will offer to keep it)."
-            else
-                ok "GitHub token has the repo and delete_repo scopes"
             fi
         fi
     else
