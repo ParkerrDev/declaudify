@@ -1,0 +1,7 @@
+# Working directories and backups declaudify produces at runtime
+*.bundle
+mirror.git/
+verify.git/
+
+# OS cruft
+.DS_Store

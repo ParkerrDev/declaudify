@@ -1,0 +1,487 @@
+#!/usr/bin/env bash
+#
+# declaudify — strip Claude attribution from a GitHub repo's history, without
+# leaving the old commits reachable anywhere on GitHub.
+#
+# A force-push is not enough: GitHub keeps pull-request refs (refs/pull/N/head)
+# that a branch push cannot touch, so the original commits stay visible in the
+# PR tab and by SHA. The only way to actually remove them is to replace the
+# repository itself, which is what this does:
+#
+#   0. mirror-clone the repo            4. push the rewritten history into it
+#   1. rewrite the history              5. verify the new repo matches
+#   2. rename the old repo to "<name>." 6. delete the old repo
+#   3. create a new repo as "<name>"
+#
+# Nothing is deleted until step 5 has proved the new repo is byte-identical in
+# content and complete in refs.
+#
+set -euo pipefail
+shopt -s inherit_errexit 2>/dev/null || true
+
+DECLAUDIFY_VERSION=1.0.0
+
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+SELF_DIR=$(dirname "$SELF")
+
+# shellcheck source=lib/common.sh
+source "$SELF_DIR/lib/common.sh"
+# shellcheck source=lib/rewrite.sh
+source "$SELF_DIR/lib/rewrite.sh"
+
+# --- hidden re-entry ---------------------------------------------------------
+# filter-branch calls back into this script so commit messages and annotated tag
+# messages go through the exact same filter. Handled before the GitHub layer is
+# sourced because it runs once per commit and must stay cheap.
+if [[ ${1:-} == --__filter-message ]]; then
+    dc_filter_message
+    exit 0
+fi
+
+# shellcheck source=lib/github.sh
+source "$SELF_DIR/lib/github.sh"
+
+# --- defaults ----------------------------------------------------------------
+
+SUFFIX='.'
+KEEP_OLD=0
+PREVIEW_LIMIT=10
+WORKDIR=''
+TARGET=''
+DECLAUDIFY_NEW_NAME=''
+DECLAUDIFY_NEW_EMAIL=''
+
+usage() {
+    cat <<'EOF'
+declaudify — remove Claude attribution from a GitHub repo's entire history
+
+USAGE
+    declaudify [options] <owner/repo | github url>
+
+WHAT IT DOES
+    Rewrites every commit message, author, committer, annotated tag message and
+    tagger that credits Claude, then migrates the result into a brand-new repo
+    of the same name so no trace survives in pull-request refs. The old repo is
+    renamed out of the way and deleted only after verification passes.
+
+OPTIONS
+    -n, --dry-run          Clone and rewrite locally, show what would change,
+                           and touch nothing on GitHub. Always run this first.
+    -y, --yes              Skip confirmation prompts. Dangerous by design.
+        --keep-old         Do everything except deleting the renamed old repo.
+        --suffix <s>       Suffix for the renamed old repo (default: ".").
+        --name <name>      Author name to reattribute Claude commits to.
+        --email <email>    Author email to reattribute Claude commits to.
+                           Both default to the repo's most frequent human author.
+        --workdir <dir>    Working directory. Default is a timestamped folder
+                           under ${XDG_CACHE_HOME:-~/.cache}/declaudify, which
+                           keeps the pre-rewrite backup bundle.
+        --drop-regex <re>  Override which message lines are deleted (lowercase ERE).
+        --identity-regex <re>
+                           Override which identities count as Claude (lowercase ERE).
+        --fallback <text>  Subject for commits whose message was entirely Claude
+                           boilerplate (default: "Update").
+        --preview <n>      Message diffs to show before confirming (default: 10).
+    -h, --help             This help.
+    -V, --version          Version.
+
+WHAT IS LOST
+    Replacing a repository cannot carry over issues, pull requests, releases,
+    stars, forks, watchers, wiki, webhooks, deploy keys, branch protection,
+    Actions secrets or Pages settings. declaudify prints an inventory of exactly
+    what the target repo has before asking you to confirm. Description, homepage,
+    topics, visibility and default branch ARE carried over.
+
+REQUIREMENTS
+    git, gh (authenticated), and the delete_repo token scope:
+        gh auth refresh -h github.com -s delete_repo
+EOF
+}
+
+# --- argument parsing --------------------------------------------------------
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -n|--dry-run)      DECLAUDIFY_DRY_RUN=1 ;;
+        -y|--yes)          DECLAUDIFY_ASSUME_YES=1 ;;
+        --keep-old)        KEEP_OLD=1 ;;
+        --suffix)          SUFFIX=${2:?--suffix needs a value}; shift ;;
+        --name)            DECLAUDIFY_NEW_NAME=${2:?--name needs a value}; shift ;;
+        --email)           DECLAUDIFY_NEW_EMAIL=${2:?--email needs a value}; shift ;;
+        --workdir)         WORKDIR=${2:?--workdir needs a value}; shift ;;
+        --drop-regex)      DECLAUDIFY_DROP_RE=${2:?--drop-regex needs a value}; shift ;;
+        --identity-regex)  DECLAUDIFY_IDENT_RE=${2:?--identity-regex needs a value}; shift ;;
+        --fallback)        DECLAUDIFY_FALLBACK=${2:?--fallback needs a value}; shift ;;
+        --preview)         PREVIEW_LIMIT=${2:?--preview needs a value}; shift ;;
+        -h|--help)         usage; exit 0 ;;
+        -V|--version)      printf 'declaudify %s\n' "$DECLAUDIFY_VERSION"; exit 0 ;;
+        -*)                die "unknown option: $1 (try --help)" ;;
+        *)                 [[ -z $TARGET ]] || die "unexpected argument: $1"; TARGET=$1 ;;
+    esac
+    shift
+done
+
+[[ -n $TARGET ]] || { usage >&2; die "no repository given"; }
+export DECLAUDIFY_DRY_RUN DECLAUDIFY_ASSUME_YES
+
+# Accept owner/name, https://github.com/owner/name(.git), git@github.com:owner/name.git
+parse_repo() {
+    local raw=$1
+    raw=${raw%.git}
+    raw=${raw#https://github.com/}
+    raw=${raw#http://github.com/}
+    raw=${raw#git@github.com:}
+    raw=${raw#ssh://git@github.com/}
+    raw=${raw%/}
+    [[ $raw == */* && $raw != */*/* ]] || die "expected owner/repo, got: $1"
+    printf '%s' "$raw"
+}
+
+REPO=$(parse_repo "$TARGET")
+OWNER=${REPO%%/*}
+NAME=${REPO##*/}
+OLD_NAME="${NAME}${SUFFIX}"
+
+# --- failure handling --------------------------------------------------------
+
+on_exit() {
+    local code=$?
+    trap - EXIT
+    if (( code != 0 )); then
+        rollback_run
+        if [[ -n ${WORKDIR:-} && -f $WORKDIR/backup.bundle ]]; then
+            say ''
+            warn "the pre-rewrite history is preserved at:"
+            say "        $WORKDIR/backup.bundle"
+            say "        restore with: git clone $WORKDIR/backup.bundle restored"
+        fi
+    fi
+    exit "$code"
+}
+trap on_exit EXIT
+
+# =============================================================================
+# Preflight
+# =============================================================================
+
+step "Preflight"
+need_cmd git
+need_cmd awk
+gh_preflight
+ok "git $(git --version | awk '{print $3}'), gh authenticated"
+
+gh_repo_exists "$REPO" || die "repository not found or not visible to you: $REPO"
+
+REPO_ID=$(gh_repo_field "$REPO" '.id')
+DEFAULT_BRANCH=$(gh_repo_field "$REPO" '.default_branch')
+VISIBILITY=$(gh_repo_field "$REPO" '.visibility')
+DESCRIPTION=$(gh_repo_field "$REPO" '.description // ""')
+HOMEPAGE=$(gh_repo_field "$REPO" '.homepage // ""')
+IS_FORK=$(gh_repo_field "$REPO" '.fork')
+IS_ARCHIVED=$(gh_repo_field "$REPO" '.archived')
+IS_ADMIN=$(gh_repo_field "$REPO" '.permissions.admin')
+CLONE_URL=$(gh_repo_field "$REPO" '.clone_url')
+
+ok "$REPO (id $REPO_ID, $VISIBILITY, default branch: $DEFAULT_BRANCH)"
+
+[[ $IS_ADMIN == true ]] || die "you need admin rights on $REPO to rename and delete it"
+[[ $IS_ARCHIVED == true ]] && die "$REPO is archived — unarchive it first"
+[[ $IS_FORK == true ]] && warn "$REPO is a fork; the replacement will be a standalone repo, not a fork"
+
+if gh_repo_exists "$OWNER/$OLD_NAME"; then
+    die "$OWNER/$OLD_NAME already exists — pick another --suffix"
+fi
+
+# Check the delete scope NOW, not after the repo has been renamed.
+if (( ! KEEP_OLD )) && [[ $DECLAUDIFY_DRY_RUN == 0 ]]; then
+    if ! gh_has_scope delete_repo; then
+        if [[ -z $(gh_token_scopes) ]]; then
+            warn "cannot read token scopes (fine-grained PAT?); deletion may fail"
+        else
+            die "your gh token lacks the delete_repo scope, so step 6 would fail after
+       the repo had already been renamed and replaced. Fix it first:
+
+           gh auth refresh -h github.com -s delete_repo
+
+       Or re-run with --keep-old to skip deletion."
+        fi
+    fi
+    ok "delete_repo scope present"
+fi
+
+# =============================================================================
+# 0. Clone
+# =============================================================================
+
+if [[ -z $WORKDIR ]]; then
+    WORKDIR="${XDG_CACHE_HOME:-$HOME/.cache}/declaudify/${OWNER}-${NAME}-$(date +%Y%m%d-%H%M%S)"
+fi
+mkdir -p "$WORKDIR"
+MIRROR="$WORKDIR/mirror.git"
+
+step "0. Cloning $REPO"
+[[ -e $MIRROR ]] && die "$MIRROR already exists"
+git clone --quiet --mirror "$CLONE_URL" "$MIRROR"
+ok "mirror clone at $MIRROR"
+
+# Back up everything the server gave us, refs/pull/* included, before touching
+# anything.
+git -C "$MIRROR" bundle create "$WORKDIR/backup.bundle" --all >/dev/null 2>&1
+git -C "$MIRROR" for-each-ref --format='%(refname) %(objectname)' > "$WORKDIR/refs-before.txt"
+ok "backup bundle: $WORKDIR/backup.bundle"
+
+# Scan BEFORE pruning. Attribution frequently survives only in refs/pull/*,
+# which is exactly what a force-push cannot reach and what this migration exists
+# to purge — pruning first would report "nothing to do" and leave it live on
+# GitHub forever.
+dc_scan "$MIRROR"
+PR_ATTR=$(( DC_SCAN_MSG_COUNT + DC_SCAN_IDENT_COUNT ))
+
+pruned=$(dc_prune_foreign_refs "$MIRROR")
+(( pruned > 0 )) && info "pruned $pruned ref(s) outside refs/heads, refs/tags, refs/notes"
+
+SNAP_BEFORE=$(dc_snapshot "$MIRROR")
+BRANCHES=$(git -C "$MIRROR" for-each-ref --format='%(refname)' refs/heads | wc -l | tr -d ' ')
+TAGS=$(git -C "$MIRROR" for-each-ref --format='%(refname)' refs/tags | wc -l | tr -d ' ')
+COMMITS=$(git -C "$MIRROR" rev-list --all --count)
+ok "$COMMITS commits, $BRANCHES branch(es), $TAGS tag(s)"
+
+# =============================================================================
+# 1. Rewrite
+# =============================================================================
+
+step "1. Scanning for Claude attribution"
+dc_scan "$MIRROR"
+say "    commit messages with attribution lines : $DC_SCAN_MSG_COUNT"
+say "    commits authored/committed by Claude   : $DC_SCAN_IDENT_COUNT"
+say "    annotated tags needing a rewrite       : $DC_SCAN_TAG_COUNT"
+
+# Attribution reachable only from the refs we just pruned — pull-request refs.
+# Rewriting cannot touch these; only replacing the repository removes them.
+PR_ONLY=$(( PR_ATTR - DC_SCAN_MSG_COUNT - DC_SCAN_IDENT_COUNT ))
+(( PR_ONLY < 0 )) && PR_ONLY=0
+say "    attributed commits in pull-request refs : $PR_ONLY"
+
+if (( DC_SCAN_TOTAL == 0 && PR_ONLY == 0 )); then
+    say ''
+    ok "no Claude attribution found in $REPO — nothing to do"
+    exit 0
+fi
+
+if (( DC_SCAN_TOTAL == 0 )); then
+    say ''
+    warn "branches and tags are already clean, but $PR_ONLY attributed commit(s)"
+    warn "survive in pull-request refs. A force-push cannot remove those — only"
+    warn "replacing the repository can, which is what this run will do."
+fi
+
+# Reattribution identity: the repo's most frequent non-Claude author.
+if [[ -z $DECLAUDIFY_NEW_NAME || -z $DECLAUDIFY_NEW_EMAIL ]]; then
+    top=$(git -C "$MIRROR" log --all --format='%an <%ae>' |
+          grep -viE "$(dc_ident_re)" | sort | uniq -c | sort -rn | head -1 |
+          sed 's/^ *[0-9]* //') || true
+    if [[ -n ${top:-} ]]; then
+        [[ -n $DECLAUDIFY_NEW_NAME ]]  || DECLAUDIFY_NEW_NAME=${top%% <*}
+        [[ -n $DECLAUDIFY_NEW_EMAIL ]] || { DECLAUDIFY_NEW_EMAIL=${top##*<}; DECLAUDIFY_NEW_EMAIL=${DECLAUDIFY_NEW_EMAIL%>}; }
+    fi
+    [[ -n $DECLAUDIFY_NEW_NAME ]]  || DECLAUDIFY_NEW_NAME=$(git config user.name || echo "$OWNER")
+    [[ -n $DECLAUDIFY_NEW_EMAIL ]] || DECLAUDIFY_NEW_EMAIL=$(git config user.email || echo "$OWNER@users.noreply.github.com")
+fi
+export DECLAUDIFY_NEW_NAME DECLAUDIFY_NEW_EMAIL
+info "Claude-authored commits will be reattributed to: $DECLAUDIFY_NEW_NAME <$DECLAUDIFY_NEW_EMAIL>"
+
+if (( PREVIEW_LIMIT > 0 && DC_SCAN_MSG_COUNT > 0 )); then
+    say ''
+    say "    ${C_BOLD}lines that will be removed${C_RESET} (first $PREVIEW_LIMIT affected commits):"
+    dc_preview "$MIRROR" "$PREVIEW_LIMIT"
+fi
+
+step "1b. Rewriting history"
+if (( DC_SCAN_TOTAL > 0 )); then
+    dc_rewrite_commits "$MIRROR" "$SELF"
+    ok "commit messages and identities rewritten"
+
+    tags_done=$(dc_rewrite_tags "$MIRROR")
+    ok "$tags_done annotated tag(s) rebuilt"
+
+    dropped=$(dc_drop_original_refs "$MIRROR")
+    ok "dropped $dropped refs/original backup ref(s)"
+    dc_gc "$MIRROR"
+else
+    info "branches and tags need no rewriting — migrating them unchanged"
+fi
+
+# --- integrity gate ---
+SNAP_AFTER=$(dc_snapshot "$MIRROR")
+
+if [[ $(printf '%s\n' "$SNAP_BEFORE" | awk '{print $1}') != \
+      $(printf '%s\n' "$SNAP_AFTER"  | awk '{print $1}') ]]; then
+    die "ref set changed during rewrite — refusing to continue"
+fi
+if [[ $(printf '%s\n' "$SNAP_BEFORE" | awk '{print $1, $2, $3}') != \
+      $(printf '%s\n' "$SNAP_AFTER"  | awk '{print $1, $2, $3}') ]]; then
+    say ''
+    diff <(printf '%s\n' "$SNAP_BEFORE") <(printf '%s\n' "$SNAP_AFTER") >&2 || true
+    die "file content or commit count changed during rewrite — refusing to continue"
+fi
+ok "content verified identical: every ref has the same tree and commit count"
+
+# Hard gates: no attribution line and no Claude identity may survive.
+left_attr=$(dc_residual_attribution_count "$MIRROR")
+left_ident=$(dc_residual_identity_count "$MIRROR")
+(( left_attr == 0 ))  || die "$left_attr attribution line(s) survived the rewrite — refusing to continue"
+(( left_ident == 0 )) || die "$left_ident commit(s) are still attributed to Claude — refusing to continue"
+ok "no attribution lines and no Claude identities remain"
+
+# Soft signal: ordinary prose that happens to mention Claude is left alone by
+# design, so this is reported rather than treated as a failure.
+residual=$(dc_residual_count "$MIRROR")
+if (( residual > 0 )); then
+    info "$residual line(s) still mention claude/anthropic in prose or in a human"
+    info "contributor's name — left untouched on purpose. Review if unexpected:"
+    info "    git -C $MIRROR log --all"
+fi
+
+if [[ $DECLAUDIFY_DRY_RUN == 1 ]]; then
+    step "Dry run complete"
+    say "    Rewritten mirror: $MIRROR"
+    say "    Backup bundle   : $WORKDIR/backup.bundle"
+    say "    Nothing on GitHub was touched. Re-run without --dry-run to migrate."
+    exit 0
+fi
+
+# =============================================================================
+# Confirmation
+# =============================================================================
+
+step "About to replace $REPO on GitHub"
+say "    1. rename  $REPO  ->  $OWNER/$OLD_NAME"
+say "    2. create  $REPO  (fresh, $VISIBILITY)"
+say "    3. push    $COMMITS commits, $BRANCHES branch(es), $TAGS tag(s)"
+if (( KEEP_OLD )); then
+    say "    4. verify, then KEEP $OWNER/$OLD_NAME (--keep-old)"
+else
+    say "    4. verify, then ${C_RED}DELETE $OWNER/$OLD_NAME permanently${C_RESET}"
+fi
+say ''
+say "    ${C_YELLOW}this does not carry over:${C_RESET}"
+say "        $(gh_inventory "$REPO" || echo 'inventory unavailable')"
+say "        plus webhooks, deploy keys, branch protection, Actions secrets,"
+say "        collaborators and any Pages configuration."
+
+# Forks are the one case where deleting the repo does NOT purge the old commits:
+# GitHub promotes a fork to root the network and the objects survive there.
+FORKS=$(gh_repo_field "$REPO" '.forks_count')
+if [[ ${FORKS:-0} != 0 ]]; then
+    say ''
+    warn "$REPO has $FORKS fork(s). Deleting it will NOT remove the old commits:"
+    warn "GitHub promotes a fork to root the network and the objects live on there."
+    warn "Delete or contact the owners of the forks as well if that matters."
+fi
+
+confirm "Replace $REPO?" "$NAME"
+
+# =============================================================================
+# 2. Rename the old repo
+# =============================================================================
+
+step "2. Renaming $REPO -> $OWNER/$OLD_NAME"
+gh_rename "$REPO" "$OLD_NAME"
+rollback_push "gh api -X PATCH repositories/$REPO_ID -f name='$NAME'"
+
+ACTUAL_OLD=$(gh_name_by_id "$REPO_ID")
+[[ -n $ACTUAL_OLD ]] || die "lost track of repo id $REPO_ID after rename"
+if [[ $ACTUAL_OLD != "$OWNER/$OLD_NAME" ]]; then
+    warn "GitHub normalised the name to $ACTUAL_OLD (requested $OWNER/$OLD_NAME)"
+fi
+ok "old repo is now $ACTUAL_OLD"
+
+# =============================================================================
+# 3. Create the replacement
+# =============================================================================
+
+step "3. Creating $REPO"
+gh_create "$REPO" "$VISIBILITY" "$DESCRIPTION" "$HOMEPAGE"
+rollback_push "gh repo delete '$REPO' --yes"
+
+for attempt in 1 2 3 4 5; do
+    gh_repo_exists "$REPO" && break
+    sleep 2
+done
+gh_repo_exists "$REPO" || die "created $REPO but it did not become visible"
+NEW_ID=$(gh_repo_field "$REPO" '.id')
+ok "created $REPO (id $NEW_ID)"
+
+# =============================================================================
+# 4. Push the rewritten history
+# =============================================================================
+
+step "4. Pushing rewritten history"
+PUSH_URL="https://github.com/$REPO.git"
+git -C "$MIRROR" push --mirror --quiet "$PUSH_URL" ||
+    die "push failed — the old repo is still intact at $ACTUAL_OLD"
+ok "pushed all branches and tags"
+
+gh_set_default_branch "$REPO" "$DEFAULT_BRANCH"
+gh_copy_topics "$ACTUAL_OLD" "$REPO"
+ok "default branch and topics restored"
+
+# =============================================================================
+# 5. Verify the new repo really has everything
+# =============================================================================
+
+step "5. Verifying $REPO"
+VERIFY="$WORKDIR/verify.git"
+rm -rf "$VERIFY"
+git clone --quiet --mirror "$PUSH_URL" "$VERIFY"
+dc_prune_foreign_refs "$VERIFY" >/dev/null
+
+SNAP_REMOTE=$(dc_snapshot "$VERIFY")
+if [[ $SNAP_REMOTE != "$SNAP_AFTER" ]]; then
+    say ''
+    diff <(printf '%s\n' "$SNAP_AFTER") <(printf '%s\n' "$SNAP_REMOTE") >&2 || true
+    die "the pushed repo does not match the rewritten history — NOT deleting anything"
+fi
+ok "all refs, trees and commit counts match the rewritten history"
+
+if [[ $(printf '%s\n' "$SNAP_BEFORE" | awk '{print $1, $2, $3}') != \
+      $(printf '%s\n' "$SNAP_REMOTE" | awk '{print $1, $2, $3}') ]]; then
+    die "the pushed repo's content differs from the original — NOT deleting anything"
+fi
+ok "content on GitHub is identical to the original repo"
+
+verify_commits=$(git -C "$VERIFY" rev-list --all --count)
+[[ $verify_commits == "$COMMITS" ]] ||
+    die "commit count mismatch: expected $COMMITS, found $verify_commits"
+ok "$verify_commits commits present"
+
+# Re-run the strict gates against what is actually on GitHub, not against what
+# we believe we pushed. This is the last check before anything is deleted.
+remote_attr=$(dc_residual_attribution_count "$VERIFY")
+remote_ident=$(dc_residual_identity_count "$VERIFY")
+(( remote_attr == 0 ))  || die "$remote_attr attribution line(s) present on GitHub — NOT deleting anything"
+(( remote_ident == 0 )) || die "$remote_ident Claude-attributed commit(s) on GitHub — NOT deleting anything"
+ok "no Claude attribution present on GitHub"
+
+# =============================================================================
+# 6. Delete the old repo
+# =============================================================================
+
+if (( KEEP_OLD )); then
+    step "6. Skipping deletion (--keep-old)"
+    warn "old repo left in place: https://github.com/$ACTUAL_OLD"
+    rollback_clear
+else
+    step "6. Deleting $ACTUAL_OLD"
+    confirm "Verification passed. Permanently delete $ACTUAL_OLD?" "delete"
+    gh_delete "$ACTUAL_OLD"
+    ok "deleted $ACTUAL_OLD"
+    rollback_clear
+fi
+
+step "Done"
+say "    $REPO now has $COMMITS commits with no Claude attribution."
+say "    Pre-rewrite backup kept at: $WORKDIR/backup.bundle"
+say ""
+say "    Existing local clones still point at the old history. Re-clone them:"
+say "        git clone https://github.com/$REPO.git"
