@@ -364,6 +364,7 @@ has "says plainly that nothing is deleted" "$src" "nothing is renamed, replaced 
 has "flushes the homepage sidebar" "$src" "gh_flush_sidebar_cache"
 has "waits on Insights" "$src" "Insights contributors clean after"
 has "waits on the sidebar" "$src" "homepage sidebar clean after"
+has "stops waiting on a sidebar it cannot read" "$src" "sidebar_blind >= 3"
 has "offers a manual fallback without admin" "$src" "Settings > General > Default branch"
 has "--no-flush can skip the toggle" "$src" "--no-flush"
 

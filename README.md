@@ -244,6 +244,10 @@ Pages config all stay exactly as they were.
   that.
 - **The sidebar flush needs admin.** Without it, Insights clears and the homepage
   sidebar does not.
+- **A private repository's sidebar cannot be read back.** GitHub does not let a
+  token in on that page. declaudify still flushes it, says after three blank
+  answers that it cannot see the result, and stops waiting for it. Look at the
+  repository's page to see for yourself.
 - `git filter-branch` spawns a process per commit, so enormous histories are
   slow. It is used on purpose instead of `git filter-repo` because it ships with
   git, and a tool that force-pushes your history should not depend on something
