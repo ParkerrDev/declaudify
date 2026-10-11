@@ -49,6 +49,7 @@ make_repo() {
     git -C "$dir" config user.name "Parker"
     git -C "$dir" config user.email "parker@example.com"
     git -C "$dir" config commit.gpgsign false
+    git -C "$dir" config tag.gpgsign false
 
     _commit "$dir" a "First commit"
 
