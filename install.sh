@@ -2,7 +2,7 @@
 #
 # declaudify installer.
 #
-#   URL=https://raw.githubusercontent.com/ParkerrDev/declaudify/main/install.sh
+#   URL=https://raw.githubusercontent.com/ParkerrDev/declaudify/master/install.sh
 #
 #   curl -fsSL "$URL" | sh
 #   curl -fsSL "$URL" | sh -s -- owner/repo     # install, then run on that repo
@@ -11,13 +11,13 @@
 #
 # Environment:
 #   DECLAUDIFY_PREFIX   install prefix (default: ~/.local, or /usr/local as root)
-#   DECLAUDIFY_REF      branch or tag to install (default: main)
+#   DECLAUDIFY_REF      branch or tag to install (default: master)
 #   DECLAUDIFY_REPO     source repo (default: ParkerrDev/declaudify)
 
 set -eu
 
 REPO="${DECLAUDIFY_REPO:-ParkerrDev/declaudify}"
-REF="${DECLAUDIFY_REF:-main}"
+REF="${DECLAUDIFY_REF:-master}"
 
 if [ "$(id -u)" -eq 0 ]; then
     PREFIX="${DECLAUDIFY_PREFIX:-/usr/local}"

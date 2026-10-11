@@ -5,7 +5,7 @@
 > **Definition:** to remove the butthole or stink from something.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ParkerrDev/declaudify/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/ParkerrDev/declaudify/master/install.sh | sh
 ```
 
 ## Why I built this
@@ -90,13 +90,13 @@ that, and that is your call to make, not this tool's.
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ParkerrDev/declaudify/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/ParkerrDev/declaudify/master/install.sh | sh
 ```
 
 Install and immediately run it on a repo:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ParkerrDev/declaudify/main/install.sh | sh -s -- owner/repo
+curl -fsSL https://raw.githubusercontent.com/ParkerrDev/declaudify/master/install.sh | sh -s -- owner/repo
 ```
 
 Or the boring way:
