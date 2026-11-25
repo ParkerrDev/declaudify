@@ -278,6 +278,7 @@ reasons.
 | `lib/rewrite.sh` | The rewrite passes, integrity snapshots and gates |
 | `lib/github.sh` | `gh` wrappers, every mutation routed through `mutate()` |
 | `tests/run-tests.sh` | The test suite |
+| `skill/declaudify/SKILL.md` | A skill for Claude Code, Codex and the other agents, so they run it the same careful way |
 
 ## License
 

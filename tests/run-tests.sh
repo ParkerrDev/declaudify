@@ -391,7 +391,7 @@ suite "no em-dashes anywhere"
 # contain the very character it is asserting the absence of.
 EMDASH=$(printf '\xe2\x80\x94')
 
-for f in declaudify install.sh lib/common.sh lib/rewrite.sh lib/github.sh tests/run-tests.sh README.md; do
+for f in declaudify install.sh lib/common.sh lib/rewrite.sh lib/github.sh tests/run-tests.sh README.md skill/declaudify/SKILL.md; do
     is "no em-dash in $f" "$(grep -c "$EMDASH" "$ROOT/$f" 2>/dev/null || true)" "0"
 done
 
